@@ -1,0 +1,135 @@
+syntax = "proto3";
+
+package streambridge;
+
+option go_package = "vt-stream-gateway/api";
+
+// StreamBridge service controls WebRTC to HLS stream conversion
+service StreamBridge {
+  // CreateSession creates a new HLS output session
+  rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
+
+  // DestroySession destroys an existing session
+  rpc DestroySession(DestroySessionRequest) returns (DestroySessionResponse);
+
+  // AddInput adds a WebRTC input to a session
+  rpc AddInput(AddInputRequest) returns (AddInputResponse);
+
+  // RemoveInput removes a WebRTC input from a session
+  rpc RemoveInput(RemoveInputRequest) returns (RemoveInputResponse);
+
+  // SetMute sets the mute status for a participant
+  rpc SetMute(SetMuteRequest) returns (SetMuteResponse);
+
+  // SetVideoOn sets the video on/off status for a participant
+  rpc SetVideoOn(SetVideoOnRequest) returns (SetVideoOnResponse);
+
+  // WriteID3Tag writes a custom ID3 tag to the HLS stream
+  rpc WriteID3Tag(WriteID3TagRequest) returns (WriteID3TagResponse);
+
+  // GetSessionInfo retrieves information about a session
+  rpc GetSessionInfo(GetSessionInfoRequest) returns (GetSessionInfoResponse);
+}
+
+// CreateSessionRequest contains parameters for creating a new session
+message CreateSessionRequest {
+  string session_id = 1;   // Unique identifier for the session
+  string output_path = 2;  // Output path for HLS manifest (e.g., "/path/to/output.m3u8")
+  bool enable_gst = 3;     // Use GStreamer backend (false=FFmpeg, true=GStreamer)
+}
+
+message CreateSessionResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// DestroySessionRequest contains parameters for destroying a session
+message DestroySessionRequest {
+  string session_id = 1;
+}
+
+message DestroySessionResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// AddInputRequest contains parameters for adding a WebRTC input
+message AddInputRequest {
+  string session_id = 1;              // Session ID to add input to
+  uint64 janus_room_id = 2;           // Janus VideoRoom plugin room ID
+  uint64 janus_session_id = 3;        // Janus session ID
+  uint64 janus_handle_id = 4;         // Janus handle ID
+  uint64 janus_publisher_id = 5;      // Publisher ID within the room
+  string janus_gateway_address = 6;   // Janus gateway address (e.g., "ws://localhost:8188")
+  string janus_admin_key = 7;         // Janus admin API key
+  string janus_admin_secret = 8;      // Janus admin secret
+  string display_name = 9;            // Participant display name
+}
+
+message AddInputResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// RemoveInputRequest contains parameters for removing a WebRTC input
+message RemoveInputRequest {
+  string session_id = 1;
+  uint64 janus_session_id = 2;
+  uint64 janus_handle_id = 3;
+  string display_name = 4;
+}
+
+message RemoveInputResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// SetMuteRequest contains parameters for setting mute status
+message SetMuteRequest {
+  string session_id = 1;
+  string user_id = 2;
+  string client_id = 3;
+  bool mute = 4;
+}
+
+message SetMuteResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// SetVideoOnRequest contains parameters for setting video on/off status
+message SetVideoOnRequest {
+  string session_id = 1;
+  string user_id = 2;
+  string client_id = 3;
+  bool video_on = 4;
+}
+
+message SetVideoOnResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// WriteID3TagRequest contains parameters for writing ID3 tags
+message WriteID3TagRequest {
+  string session_id = 1;
+  string event_data = 2;
+  string event_type = 3;
+}
+
+message WriteID3TagResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// GetSessionInfoRequest contains parameters for getting session info
+message GetSessionInfoRequest {
+  string session_id = 1;
+}
+
+message GetSessionInfoResponse {
+  bool success = 1;
+  string message = 2;
+  int32 participant_count = 3;
+  repeated string participant_names = 4;
+}

@@ -1,0 +1,57 @@
+# StreamBridge Configuration Example
+# Copy this file to config.yaml and adjust values as needed
+
+# gRPC Server Configuration
+server:
+  # Port to listen on (default: 50051)
+  port: 50065
+
+  # Maximum number of concurrent gRPC streams (default: 100)
+  max_concurrent_streams: 100
+
+  # Connection timeout for keepalive (default: 30s)
+  connection_timeout: 30s
+
+  # Enable gRPC reflection for debugging (default: true)
+  enable_reflection: true
+
+# Janus Gateway Default Configuration
+# These values are used as defaults when not specified in AddInput requests
+janus:
+  # Janus Gateway WebSocket address
+  gateway_address: "ws://localhost:8188"
+
+  # Janus admin API key
+  admin_key: "adminpwd"
+
+  # Janus admin secret
+  admin_secret: "admin"
+
+  # Connection timeout in seconds (default: 10)
+  timeout: 10
+
+# HLS Output Configuration
+hls:
+  # Base directory for HLS output files
+  # Relative paths in CreateSession will be joined with this directory
+  output_dir: "/tmp/livestream"
+
+  # HLS segment duration in seconds (default: 4)
+  segment_duration: 4
+
+  # Number of segments to keep in playlist (default: 5)
+  playlist_length: 5
+
+  # Use GStreamer backend instead of FFmpeg (default: false)
+  enable_gstreamer: false
+
+# Logging Configuration
+logging:
+  # Log level: debug, info, warn, error (default: info)
+  level: "info"
+
+  # Log format: text, json (default: text)
+  format: "text"
+
+  # Log output: stdout, stderr, or file path (default: stdout)
+  output: "stdout"

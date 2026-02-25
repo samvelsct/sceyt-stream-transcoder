@@ -1,0 +1,41 @@
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Go workspace file
+go.work
+
+# Generated protobuf files
+api/*.pb.go
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# HLS output files (for testing)
+*.m3u8
+*.ts
+*.mp4
+
+# Large test files
+*.yuv
+
+# Environment files
+.env
