@@ -4,11 +4,15 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"sync"
 
 	pb "vt-stream-transcoder/api"
 	"vt-stream-transcoder/internal/config"
+	"vt-stream-transcoder/internal/httpserver"
 
+	zlog "github.com/rs/zerolog/log"
 	"github.com/samvelsct/go-webrtchls/webrtchls"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -20,28 +24,58 @@ type Server struct {
 	ctx      *webrtchls.Context
 	sessions map[string]*webrtchls.Session
 	config   *config.Config
+	hlsSrv   *httpserver.Server // LL-HLS HTTP server (may be nil)
 	mu       sync.RWMutex
+	memStats map[string]runtime.MemStats // Per-session memory tracking
 }
 
-// NewServer creates a new StreamBridge server
-func NewServer(cfg *config.Config) (*Server, error) {
+// NewServer creates a new StreamBridge server.
+// hlsSrv may be nil; when provided, each session will be registered with the
+// HTTP server so its segments are served at /streams/{sessionID}/...
+func NewServer(cfg *config.Config, hlsSrv *httpserver.Server) (serverPtr *Server, finalErr error) {
+	// Add panic recovery with detailed logging
+	defer func() {
+		if r := recover(); r != nil {
+			zlog.Error().Msgf("!!! PANIC in NewServer: %v !!!", r)
+			zlog.Error().Msg("=== PANIC STACK TRACE ===")
+			zlog.Error().Msg(string(debug.Stack()))
+			zlog.Error().Msg("=== END PANIC STACK TRACE ===")
+
+			finalErr = fmt.Errorf("panic in NewServer: %v", r)
+			serverPtr = nil
+		}
+	}()
+
+	zlog.Info().Msg("Initializing webrtchls library...")
+
 	// Initialize the webrtchls library
 	if err := webrtchls.Init(); err != nil {
+		zlog.Error().Err(err).Msg("Failed to initialize webrtchls")
 		return nil, fmt.Errorf("failed to initialize webrtchls: %w", err)
 	}
+	zlog.Info().Msg("webrtchls library initialized successfully")
 
 	// Create a context
+	zlog.Info().Msg("Creating webrtchls context...")
 	ctx := webrtchls.NewContext()
 	if ctx == nil {
+		zlog.Error().Msg("webrtchls.NewContext() returned nil")
 		webrtchls.Cleanup()
 		return nil, fmt.Errorf("failed to create webrtchls context")
 	}
+	zlog.Info().Msg("webrtchls context created successfully")
 
-	return &Server{
+	zlog.Info().Msg("Creating Server struct...")
+	server := &Server{
 		ctx:      ctx,
 		sessions: make(map[string]*webrtchls.Session),
 		config:   cfg,
-	}, nil
+		hlsSrv:   hlsSrv,
+		memStats: make(map[string]runtime.MemStats),
+	}
+	zlog.Info().Msg("Server struct created successfully")
+
+	return server, nil
 }
 
 // Close cleans up the server resources
@@ -67,6 +101,7 @@ func (s *Server) Close() {
 
 // CreateSession creates a new HLS output session
 func (s *Server) CreateSession(ctx context.Context, req *pb.CreateSessionRequest) (*pb.CreateSessionResponse, error) {
+	zlog.Info().Msgf("CreateSessionRequest: %v", req)
 	if req.SessionId == "" {
 		return &pb.CreateSessionResponse{
 			Success: false,
@@ -98,6 +133,8 @@ func (s *Server) CreateSession(ctx context.Context, req *pb.CreateSessionRequest
 		outputPath = filepath.Join(s.config.HLS.OutputDir, outputPath)
 	}
 
+	zlog.Info().Msgf("Create session with output_path: %s", outputPath)
+
 	// Use configured GStreamer setting if not specified in request
 	enableGst := req.EnableGst
 	if !req.EnableGst && s.config.HLS.EnableGStreamer {
@@ -119,6 +156,18 @@ func (s *Server) CreateSession(ctx context.Context, req *pb.CreateSessionRequest
 
 	s.sessions[req.SessionId] = session
 
+	// Register with the LL-HLS HTTP server so segments are served over HTTP.
+	if s.hlsSrv != nil {
+		if regErr := s.hlsSrv.RegisterSession(req.SessionId, session); regErr != nil {
+			zlog.Warn().Err(regErr).Str("session_id", req.SessionId).Msg("Failed to register session with HLS HTTP server")
+		}
+	}
+
+	// Capture memory stats after session creation
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+	s.memStats[req.SessionId] = memStats
+
 	return &pb.CreateSessionResponse{
 		Success: true,
 		Message: "session created successfully",
@@ -127,6 +176,8 @@ func (s *Server) CreateSession(ctx context.Context, req *pb.CreateSessionRequest
 
 // DestroySession destroys an existing session
 func (s *Server) DestroySession(ctx context.Context, req *pb.DestroySessionRequest) (*pb.DestroySessionResponse, error) {
+	zlog.Info().Msgf("DestroySession: %v", req)
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -141,6 +192,37 @@ func (s *Server) DestroySession(ctx context.Context, req *pb.DestroySessionReque
 	session.Destroy()
 	delete(s.sessions, req.SessionId)
 
+	// Unregister from the LL-HLS HTTP server.
+	if s.hlsSrv != nil {
+		s.hlsSrv.UnregisterSession(req.SessionId)
+	}
+
+	// Get memory stats for this specific session
+	m1, hasStats := s.memStats[req.SessionId]
+	delete(s.memStats, req.SessionId)
+
+	if hasStats {
+		// Force GC to get more accurate measurements
+		runtime.GC()
+
+		var m2 runtime.MemStats
+		runtime.ReadMemStats(&m2)
+
+		allocated := m2.TotalAlloc - m1.TotalAlloc
+		heapDelta := int64(m2.HeapAlloc) - int64(m1.HeapAlloc)
+		mallocsDelta := m2.Mallocs - m1.Mallocs
+		freesDelta := m2.Frees - m1.Frees
+
+		zlog.Info().
+			Str("session_id", req.SessionId).
+			Uint64("total_allocated_bytes", allocated).
+			Int64("heap_delta_bytes", heapDelta).
+			Uint64("mallocs", mallocsDelta).
+			Uint64("frees", freesDelta).
+			Uint64("live_objects", mallocsDelta-freesDelta).
+			Msg("Session memory statistics")
+	}
+
 	return &pb.DestroySessionResponse{
 		Success: true,
 		Message: "session destroyed successfully",
@@ -149,6 +231,8 @@ func (s *Server) DestroySession(ctx context.Context, req *pb.DestroySessionReque
 
 // AddInput adds a WebRTC input to a session
 func (s *Server) AddInput(ctx context.Context, req *pb.AddInputRequest) (*pb.AddInputResponse, error) {
+	zlog.Info().Msgf("AddInput: %v", req)
+
 	s.mu.RLock()
 	session, exists := s.sessions[req.SessionId]
 	s.mu.RUnlock()
@@ -176,7 +260,7 @@ func (s *Server) AddInput(ctx context.Context, req *pb.AddInputRequest) (*pb.Add
 		janusAdminSecret = s.config.Janus.AdminSecret
 	}
 
-	err := session.AddInput(&webrtchls.InputConfig{
+	inputConfig := &webrtchls.InputConfig{
 		JanusRoomID:         req.JanusRoomId,
 		JanusSessionID:      req.JanusSessionId,
 		JanusHandleID:       req.JanusHandleId,
@@ -185,8 +269,24 @@ func (s *Server) AddInput(ctx context.Context, req *pb.AddInputRequest) (*pb.Add
 		JanusAdminKey:       janusAdminKey,
 		JanusAdminSecret:    janusAdminSecret,
 		DisplayName:         req.DisplayName,
-	})
+	}
+
+	zlog.Debug().
+		Uint64("janus_room_id", req.JanusRoomId).
+		Uint64("janus_session_id", req.JanusSessionId).
+		Uint64("janus_handle_id", req.JanusHandleId).
+		Uint64("janus_publisher_id", req.JanusPublisherId).
+		Str("janus_gateway", janusGateway).
+		Str("display_name", req.DisplayName).
+		Msg("Calling session.AddInput with config")
+
+	err := session.AddInput(inputConfig)
 	if err != nil {
+		zlog.Error().
+			Err(err).
+			Uint64("janus_publisher_id", req.JanusPublisherId).
+			Str("display_name", req.DisplayName).
+			Msg("Failed to add input")
 		return &pb.AddInputResponse{
 			Success: false,
 			Message: fmt.Sprintf("failed to add input: %v", err),
@@ -201,6 +301,8 @@ func (s *Server) AddInput(ctx context.Context, req *pb.AddInputRequest) (*pb.Add
 
 // RemoveInput removes a WebRTC input from a session
 func (s *Server) RemoveInput(ctx context.Context, req *pb.RemoveInputRequest) (*pb.RemoveInputResponse, error) {
+	zlog.Info().Msgf("RemoveInput: %v", req)
+
 	s.mu.RLock()
 	session, exists := s.sessions[req.SessionId]
 	s.mu.RUnlock()
@@ -212,6 +314,7 @@ func (s *Server) RemoveInput(ctx context.Context, req *pb.RemoveInputRequest) (*
 		}, status.Error(codes.NotFound, "session not found")
 	}
 
+	zlog.Info().Msgf("RemoveInput: session exist %v", req)
 	err := session.RemoveInput(req.JanusSessionId, req.JanusHandleId, req.DisplayName)
 	if err != nil {
 		return &pb.RemoveInputResponse{

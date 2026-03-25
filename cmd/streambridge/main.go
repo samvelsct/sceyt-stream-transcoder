@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -8,10 +9,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
+	"time"
 
 	pb "vt-stream-transcoder/api"
 	"vt-stream-transcoder/internal/config"
+	"vt-stream-transcoder/internal/httpserver"
 	"vt-stream-transcoder/internal/server"
 
 	"google.golang.org/grpc"
@@ -22,6 +26,7 @@ import (
 var (
 	configFile = flag.String("config", "", "Path to configuration file (YAML)")
 	port       = flag.Int("port", 0, "The gRPC server port (overrides config)")
+	hlsAddr    = flag.String("hls-addr", ":8090", "Address for the LL-HLS HTTP server")
 	showConfig = flag.Bool("show-config", false, "Show current configuration and exit")
 )
 
@@ -34,8 +39,51 @@ func startHealthCheck() {
 	}()
 }
 
+func setupSignalHandlers() {
+	// Setup signal handler for SIGSEGV to capture backtrace
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGSEGV, syscall.SIGABRT, syscall.SIGBUS, syscall.SIGILL)
+
+	go func() {
+		sig := <-sigChan
+		log.Printf("!!! FATAL SIGNAL RECEIVED: %v !!!", sig)
+		log.Println("=== STACK TRACE ===")
+		debug.PrintStack()
+		log.Println("=== END STACK TRACE ===")
+
+		// Also write to stderr for immediate visibility
+		fmt.Fprintf(os.Stderr, "\n!!! FATAL SIGNAL RECEIVED: %v !!!\n", sig)
+		fmt.Fprintf(os.Stderr, "=== STACK TRACE ===\n")
+		os.Stderr.Write(debug.Stack())
+		fmt.Fprintf(os.Stderr, "=== END STACK TRACE ===\n")
+
+		// Exit with error code
+		os.Exit(139)
+	}()
+}
+
 func main() {
+	// Recover from panics with stack trace
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("!!! PANIC RECOVERED: %v !!!", r)
+			log.Println("=== PANIC STACK TRACE ===")
+			debug.PrintStack()
+			log.Println("=== END PANIC STACK TRACE ===")
+
+			fmt.Fprintf(os.Stderr, "\n!!! PANIC RECOVERED: %v !!!\n", r)
+			fmt.Fprintf(os.Stderr, "=== PANIC STACK TRACE ===\n")
+			os.Stderr.Write(debug.Stack())
+			fmt.Fprintf(os.Stderr, "=== END PANIC STACK TRACE ===\n")
+
+			os.Exit(2)
+		}
+	}()
+
 	flag.Parse()
+
+	// Setup signal handlers for crash debugging
+	setupSignalHandlers()
 
 	// Load configuration
 	cfg := config.LoadOrDefault(*configFile)
@@ -80,11 +128,26 @@ func main() {
 		log.Fatalf("Failed to listen on port %d: %v", cfg.Server.Port, err)
 	}
 
+	// Start LL-HLS HTTP server.
+	hlsSrv := httpserver.New(*hlsAddr)
+	hlsSrv.Start()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		hlsSrv.Stop(ctx)
+	}()
+	log.Printf("LL-HLS HTTP server listening on %s", *hlsAddr)
+
 	// Create StreamBridge server with config
-	streamBridgeServer, err := server.NewServer(cfg)
+	log.Println("Creating StreamBridge server...")
+	streamBridgeServer, err := server.NewServer(cfg, hlsSrv)
 	if err != nil {
+		log.Printf("Failed to create server: %v", err)
+		log.Println("Stack trace at error:")
+		debug.PrintStack()
 		log.Fatalf("Failed to create server: %v", err)
 	}
+	log.Println("StreamBridge server created successfully")
 	defer streamBridgeServer.Close()
 
 	// Create gRPC server with options
