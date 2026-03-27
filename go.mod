@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/rs/zerolog v1.34.0
-	github.com/samvelsct/go-webrtchls v0.0.1-0.20260321105934-12389dacb311
+	github.com/samvelsct/go-webrtchls v0.0.1-0.20260327121740-d30f5329d2c5
 	google.golang.org/grpc v1.79.1
 	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v3 v3.0.1

@@ -9,6 +9,7 @@ ENV GO111MODULE=on \
     GOARCH=amd64 \
     GOLANG_PROTOBUF_REGISTRATION_CONFLICT=warn \
     GOPRIVATE=github.com/samvelsct/* \
+    GOWORK=off \
     GITHUB_TOKEN=$GITHUB_TOKEN \
     DEBIAN_FRONTEND=noninteractive
 
@@ -93,4 +94,5 @@ RUN chmod +x ./entrypoint.sh
 EXPOSE 8080
 
 # Run the application
-CMD ["./entrypoint.sh"]
+#CMD ["./entrypoint.sh"]
+CMD ["./app", "--config", "/root/config.yaml"]

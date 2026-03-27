@@ -11,15 +11,15 @@ import (
 
 // Config holds the application configuration
 type Config struct {
-	Server   ServerConfig   `yaml:"server"`
-	Janus    JanusConfig    `yaml:"janus"`
-	HLS      HLSConfig      `yaml:"hls"`
-	Logging  LoggingConfig  `yaml:"logging"`
+	Server  ServerConfig  `yaml:"server"`
+	Janus   JanusConfig   `yaml:"janus"`
+	HLS     HLSConfig     `yaml:"hls"`
+	Logging LoggingConfig `yaml:"logging"`
 }
 
 // ServerConfig holds gRPC server configuration
 type ServerConfig struct {
-	Port                int           `yaml:"port"`
+	Port                 int           `yaml:"port"`
 	MaxConcurrentStreams uint32        `yaml:"max_concurrent_streams"`
 	ConnectionTimeout    time.Duration `yaml:"connection_timeout"`
 	EnableReflection     bool          `yaml:"enable_reflection"`
@@ -35,10 +35,14 @@ type JanusConfig struct {
 
 // HLSConfig holds HLS output configuration
 type HLSConfig struct {
-	OutputDir      string `yaml:"output_dir"`
-	SegmentDuration int    `yaml:"segment_duration"`
-	PlaylistLength  int    `yaml:"playlist_length"`
-	EnableGStreamer bool   `yaml:"enable_gstreamer"`
+	OutputDir       string  `yaml:"output_dir"`
+	SegmentDuration float64 `yaml:"segment_duration"`
+	PartDuration    float64 `yaml:"part_duration"`
+	PlaylistWindow  int     `yaml:"playlist_window"`
+	EnableGStreamer bool    `yaml:"enable_gstreamer"`
+	Width           int     `yaml:"width"`
+	Height          int     `yaml:"height"`
+	FPS             int     `yaml:"fps"`
 }
 
 // LoggingConfig holds logging configuration
@@ -52,7 +56,7 @@ type LoggingConfig struct {
 func Default() *Config {
 	return &Config{
 		Server: ServerConfig{
-			Port:                50051,
+			Port:                 50051,
 			MaxConcurrentStreams: 100,
 			ConnectionTimeout:    30 * time.Second,
 			EnableReflection:     true,
@@ -65,9 +69,13 @@ func Default() *Config {
 		},
 		HLS: HLSConfig{
 			OutputDir:       "/tmp/hls",
-			SegmentDuration: 4,
-			PlaylistLength:  5,
+			SegmentDuration: 1,
+			PartDuration:    0.2,
+			PlaylistWindow:  5,
 			EnableGStreamer: false,
+			Width:           1280,
+			Height:          720,
+			FPS:             30,
 		},
 		Logging: LoggingConfig{
 			Level:  "info",
@@ -156,18 +164,38 @@ func (c *Config) applyEnvironment() {
 		c.HLS.OutputDir = dir
 	}
 	if duration := os.Getenv("HLS_SEGMENT_DURATION"); duration != "" {
-		if d, err := strconv.Atoi(duration); err == nil {
+		if d, err := strconv.ParseFloat(duration, 64); err == nil {
 			c.HLS.SegmentDuration = d
+		}
+	}
+	if partDur := os.Getenv("HLS_PART_DURATION"); partDur != "" {
+		if d, err := strconv.ParseFloat(partDur, 64); err == nil {
+			c.HLS.PartDuration = d
 		}
 	}
 	if length := os.Getenv("HLS_PLAYLIST_LENGTH"); length != "" {
 		if l, err := strconv.Atoi(length); err == nil {
-			c.HLS.PlaylistLength = l
+			c.HLS.PlaylistWindow = l
 		}
 	}
 	if gst := os.Getenv("HLS_ENABLE_GSTREAMER"); gst != "" {
 		if g, err := strconv.ParseBool(gst); err == nil {
 			c.HLS.EnableGStreamer = g
+		}
+	}
+	if width := os.Getenv("HLS_WIDTH"); width != "" {
+		if w, err := strconv.Atoi(width); err == nil {
+			c.HLS.Width = w
+		}
+	}
+	if height := os.Getenv("HLS_HEIGHT"); height != "" {
+		if h, err := strconv.Atoi(height); err == nil {
+			c.HLS.Height = h
+		}
+	}
+	if fps := os.Getenv("HLS_FPS"); fps != "" {
+		if f, err := strconv.Atoi(fps); err == nil {
+			c.HLS.FPS = f
 		}
 	}
 
@@ -211,7 +239,7 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("HLS segment duration must be at least 1 second")
 	}
 
-	if c.HLS.PlaylistLength < 1 {
+	if c.HLS.PlaylistWindow < 1 {
 		return fmt.Errorf("HLS playlist length must be at least 1")
 	}
 

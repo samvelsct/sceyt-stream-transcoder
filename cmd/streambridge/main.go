@@ -26,7 +26,7 @@ import (
 var (
 	configFile = flag.String("config", "", "Path to configuration file (YAML)")
 	port       = flag.Int("port", 0, "The gRPC server port (overrides config)")
-	hlsAddr    = flag.String("hls-addr", ":8090", "Address for the LL-HLS HTTP server")
+	hlsAddr    = flag.String("hls-addr", ":8080", "Address for the LL-HLS HTTP server")
 	showConfig = flag.Bool("show-config", false, "Show current configuration and exit")
 )
 
@@ -109,7 +109,7 @@ func main() {
 		fmt.Printf("  Janus Admin Key: %s\n", cfg.Janus.AdminKey)
 		fmt.Printf("\n  HLS Output Dir: %s\n", cfg.HLS.OutputDir)
 		fmt.Printf("  HLS Segment Duration: %d seconds\n", cfg.HLS.SegmentDuration)
-		fmt.Printf("  HLS Playlist Length: %d segments\n", cfg.HLS.PlaylistLength)
+		fmt.Printf("  HLS Playlist Window: %d segments\n", cfg.HLS.PlaylistWindow)
 		fmt.Printf("  Enable GStreamer: %v\n", cfg.HLS.EnableGStreamer)
 		fmt.Printf("\n  Log Level: %s\n", cfg.Logging.Level)
 		fmt.Printf("  Log Format: %s\n", cfg.Logging.Format)
@@ -129,7 +129,7 @@ func main() {
 	}
 
 	// Start LL-HLS HTTP server.
-	hlsSrv := httpserver.New(*hlsAddr)
+	hlsSrv := httpserver.New(*hlsAddr, &cfg.HLS)
 	hlsSrv.Start()
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

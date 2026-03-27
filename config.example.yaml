@@ -36,14 +36,26 @@ hls:
   # Relative paths in CreateSession will be joined with this directory
   output_dir: "/tmp/livestream"
 
-  # HLS segment duration in seconds (default: 4)
+  # HLS segment duration in seconds (default: 1)
   segment_duration: 4
 
+  # LL-HLS part duration in seconds (default: 0.2)
+  part_duration: 0.5
+
   # Number of segments to keep in playlist (default: 5)
-  playlist_length: 5
+  playlist_window: 5
 
   # Use GStreamer backend instead of FFmpeg (default: false)
   enable_gstreamer: false
+
+  # Output video width in pixels (default: 1280)
+  width: 540
+
+  # Output video height in pixels (default: 720)
+  height: 960
+
+  # Output frames per second (default: 30)
+  fps: 20
 
 # Logging Configuration
 logging:

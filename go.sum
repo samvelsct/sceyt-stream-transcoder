@@ -53,6 +53,10 @@ github.com/samvelsct/go-webrtchls v0.0.1-0.20260305113732-c27c8d631992 h1:N1xmz7
 github.com/samvelsct/go-webrtchls v0.0.1-0.20260305113732-c27c8d631992/go.mod h1:ekfqFAxgrzhZAkgIjVmm0iYsF4Nih3KaVY/746cZusQ=
 github.com/samvelsct/go-webrtchls v0.0.1-0.20260321105934-12389dacb311 h1:GdCWviKUKhetViXQZQuzxwvKHHuKpSHh5PN1c9tc0uE=
 github.com/samvelsct/go-webrtchls v0.0.1-0.20260321105934-12389dacb311/go.mod h1:ekfqFAxgrzhZAkgIjVmm0iYsF4Nih3KaVY/746cZusQ=
+github.com/samvelsct/go-webrtchls v0.0.1-0.20260326132712-c6341a61389a h1:0KLdqqg/C8XNzpA5GbXr0Ha5svns4u4YZz5td2CG3vc=
+github.com/samvelsct/go-webrtchls v0.0.1-0.20260326132712-c6341a61389a/go.mod h1:ekfqFAxgrzhZAkgIjVmm0iYsF4Nih3KaVY/746cZusQ=
+github.com/samvelsct/go-webrtchls v0.0.1-0.20260327121740-d30f5329d2c5 h1:1aFSOrUnWhqDxQ61mVN4h8xbuFkdsQoz59n5XFxQB7E=
+github.com/samvelsct/go-webrtchls v0.0.1-0.20260327121740-d30f5329d2c5/go.mod h1:ekfqFAxgrzhZAkgIjVmm0iYsF4Nih3KaVY/746cZusQ=
 go.opentelemetry.io/auto/sdk v1.2.1 h1:jXsnJ4Lmnqd11kwkBV2LgLoFMZKizbCi5fNZ/ipaZ64=
 go.opentelemetry.io/auto/sdk v1.2.1/go.mod h1:KRTj+aOaElaLi+wW1kO/DZRXwkF4C5xPbEe3ZiIhN7Y=
 go.opentelemetry.io/otel v1.39.0 h1:8yPrr/S0ND9QEfTfdP9V+SiwT4E0G7Y5MO7p85nis48=

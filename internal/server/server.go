@@ -143,9 +143,14 @@ func (s *Server) CreateSession(ctx context.Context, req *pb.CreateSessionRequest
 
 	// Create the session
 	session, err := s.ctx.CreateSession(&webrtchls.SessionConfig{
-		SessionID:  req.SessionId,
-		OutputPath: outputPath,
-		EnableGst:  enableGst,
+		SessionID:          req.SessionId,
+		OutputPath:         outputPath,
+		EnableGst:          enableGst,
+		VideoWidth:         s.config.HLS.Width,
+		VideoHeight:        s.config.HLS.Height,
+		VideoFPS:           s.config.HLS.FPS,
+		PartDurationSec:    s.config.HLS.PartDuration,
+		SegmentDurationSec: s.config.HLS.SegmentDuration,
 	})
 	if err != nil {
 		return &pb.CreateSessionResponse{
