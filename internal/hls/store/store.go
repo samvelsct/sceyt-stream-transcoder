@@ -4,6 +4,8 @@ import (
 	"sync"
 	"time"
 	"vt-stream-transcoder/internal/config"
+
+	zlog "github.com/rs/zerolog/log"
 )
 
 // partAccumulator collects fMP4 fragments until enough duration has
@@ -86,7 +88,6 @@ func (s *Store) GetInit() *InitSegment {
 // (if needed) the segment.
 func (s *Store) AddFragment(data []byte, durationSec float64, isKeyframe bool) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	// Lazy-initialize current segment and part.
 	if s.currentSeg == nil {
@@ -106,17 +107,38 @@ func (s *Store) AddFragment(data []byte, durationSec float64, isKeyframe bool) {
 	s.currentPart.data = append(s.currentPart.data, data...)
 	s.currentPart.duration += durationSec
 
-	// Only finalize the part once enough duration has accumulated.
+	zlog.Debug().
+		Int("frag_bytes", len(data)).
+		Float64("frag_duration_sec", durationSec).
+		Bool("keyframe", isKeyframe).
+		Int("current_msn", s.currentSeg.MSN).
+		Float64("accumulated_part_duration", s.currentPart.duration).
+		Float64("part_duration_target", s.cfg.PartDuration).
+		Int("parts_in_seg", len(s.currentSeg.Parts)).
+		Msg("store: fragment added")
+
+	// Finalize the part if enough duration has accumulated, capturing any
+	// pending broadcast so we can fire it after releasing the lock.
+	var pendingMSN, pendingPart int
+	var hasPending bool
 	if s.currentPart.duration >= s.cfg.PartDuration {
-		s.finalizePart()
+		pendingMSN, pendingPart, hasPending = s.finalizePart()
+	}
+
+	s.mu.Unlock()
+
+	// Broadcast outside the lock so waiters don't race against it.
+	if hasPending {
+		s.notifier.Broadcast(pendingMSN, pendingPart)
 	}
 }
 
 // finalizePart closes the current part and appends it to the current segment.
-// Must be called with s.mu held.
-func (s *Store) finalizePart() {
+// Must be called with s.mu held. Returns the (msn, partIdx) to broadcast and
+// whether a broadcast is needed; the caller must fire it after releasing s.mu.
+func (s *Store) finalizePart() (broadcastMSN, broadcastPart int, ok bool) {
 	if s.currentPart == nil || len(s.currentPart.data) == 0 {
-		return
+		return 0, 0, false
 	}
 
 	part := &Part{
@@ -132,23 +154,42 @@ func (s *Store) finalizePart() {
 	s.currentSeg.Data = append(s.currentSeg.Data, part.Data...)
 	s.currentPart = nil
 
-	// Broadcast that a new part is available.
-	msn := s.currentSeg.MSN
-	partIdx := part.Index
-	go s.notifier.Broadcast(msn, partIdx)
+	zlog.Debug().
+		Int("msn", part.SegmentMSN).
+		Int("part_idx", part.Index).
+		Int("part_bytes", len(part.Data)).
+		Int64("part_duration_ms", part.Duration).
+		Bool("independent", part.Independent).
+		Int64("seg_duration_ms", s.currentSeg.Duration).
+		Int64("seg_duration_target_ms", s.SegmentDurationD.Milliseconds()).
+		Msg("store: part finalized")
 
-	// Check if we should close the current segment.
+	broadcastMSN = s.currentSeg.MSN
+	broadcastPart = part.Index
+
+	// Check if we should close the current segment; if so the segment
+	// broadcast supersedes the part broadcast.
 	if s.currentSeg.Duration >= s.SegmentDurationD.Milliseconds() {
-		s.finalizeSegment()
+		broadcastMSN, broadcastPart = s.finalizeSegment()
 	}
+
+	return broadcastMSN, broadcastPart, true
 }
 
 // finalizeSegment closes the current segment and starts a new one.
-// Must be called with s.mu held.
-func (s *Store) finalizeSegment() {
+// Must be called with s.mu held. Returns the (msn, partIdx=-1) to broadcast;
+// the caller must fire it after releasing s.mu.
+func (s *Store) finalizeSegment() (broadcastMSN, broadcastPart int) {
 	if s.currentSeg == nil {
-		return
+		return 0, 0
 	}
+
+	zlog.Debug().
+		Int("msn", s.currentSeg.MSN).
+		Int("parts", len(s.currentSeg.Parts)).
+		Int64("duration_ms", s.currentSeg.Duration).
+		Int("total_completed_segs", len(s.segments)).
+		Msg("store: segment finalized")
 
 	s.currentSeg.Completed = true
 	completedSeg := s.currentSeg
@@ -167,11 +208,11 @@ func (s *Store) finalizeSegment() {
 	}
 	s.nextMSN++
 
-	go s.notifier.Broadcast(completedMSN, -1)
-
 	if s.diskWriter != nil {
 		s.diskWriter.WriteSegment(completedSeg)
 	}
+
+	return completedMSN, -1
 }
 
 // Finalize forces any in-progress part and segment to be closed, then
@@ -179,15 +220,21 @@ func (s *Store) finalizeSegment() {
 // playlist. Call this after the encoding pipeline has been fully flushed.
 func (s *Store) Finalize() {
 	s.mu.Lock()
+	var pendingMSN, pendingPart int
+	var hasPending bool
 	if s.currentPart != nil && len(s.currentPart.data) > 0 {
-		s.finalizePart()
+		pendingMSN, pendingPart, hasPending = s.finalizePart()
 	}
 	if s.currentSeg != nil && s.currentSeg.Duration > 0 {
-		s.finalizeSegment()
+		pendingMSN, pendingPart = s.finalizeSegment()
+		hasPending = true
 	}
 	dw := s.diskWriter
 	s.mu.Unlock()
 
+	if hasPending {
+		s.notifier.Broadcast(pendingMSN, pendingPart)
+	}
 	if dw != nil {
 		dw.Finalize()
 	}
@@ -262,7 +309,18 @@ func (s *Store) HasPartOrSegment(targetMSN, targetPart int) bool {
 		}
 		return false
 	}
-	return s.GetPart(targetMSN, targetPart) != nil
+	// Inline part lookup — must not call GetPart() here as it would
+	// attempt to re-acquire RLock while we already hold it, which
+	// deadlocks when a writer is pending (AddFragment waiting for Lock).
+	for _, seg := range s.segments {
+		if seg.MSN == targetMSN && targetPart < len(seg.Parts) {
+			return true
+		}
+	}
+	if s.currentSeg != nil && s.currentSeg.MSN == targetMSN && targetPart < len(s.currentSeg.Parts) {
+		return true
+	}
+	return false
 }
 
 // Snapshot returns an immutable snapshot of the current store state.

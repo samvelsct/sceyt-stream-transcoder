@@ -531,18 +531,30 @@ func (s *Server) RegisterSession(sessionID string, session *webrtchls.Session) e
 
 	err := session.SetSegmentCallback(func(name string, data []byte) {
 		name = strings.TrimSuffix(name, ".tmp")
-		//zlog.Debug().
-		//	Str("session", sessionID).
-		//	Str("file", name).
-		//	Int("bytes", len(data)).
-		//	Msg("segment callback")
-		//state.ingest(name, data)
 		if name == "init.mp4" {
+			zlog.Debug().
+				Str("session", sessionID).
+				Int("bytes", len(data)).
+				Msg("ingest: init.mp4")
 			st.SetInit(data)
 		} else if strings.HasSuffix(name, ".m3u8") {
+			// discard library-generated playlist
 		} else if strings.HasSuffix(name, ".m4s") {
 			dur, isKey := segmenter.ParseMoofFromBytes(data, 0)
+			zlog.Debug().
+				Str("session", sessionID).
+				Str("file", name).
+				Int("bytes", len(data)).
+				Float64("parsed_duration_sec", dur).
+				Bool("keyframe", isKey).
+				Msg("ingest: fragment")
 			st.AddFragment(data, dur, isKey)
+		} else {
+			zlog.Debug().
+				Str("session", sessionID).
+				Str("file", name).
+				Int("bytes", len(data)).
+				Msg("ingest: unknown file (ignored)")
 		}
 	})
 	if err != nil {
@@ -607,7 +619,7 @@ func (s *Server) sessionRouter(w http.ResponseWriter, r *http.Request) {
 		s.servePlaylist(w, r, st)
 
 	case strings.HasPrefix(resource, "segment-"):
-		s.servePlaylist(w, r, st)
+		s.serveSegment(w, r, st, resource)
 
 	case strings.HasPrefix(resource, "part-"):
 		s.servePart(w, r, st, resource)
@@ -706,6 +718,7 @@ func (s *Server) servePlaylist(w http.ResponseWriter, r *http.Request, st *store
 
 	// Non-blocking request: serve current playlist immediately.
 	if msnStr == "" {
+		zlog.Debug().Msg("playlist request (non-blocking)")
 		generatePlaylist()
 		return
 	}
@@ -724,14 +737,29 @@ func (s *Server) servePlaylist(w http.ResponseWriter, r *http.Request, st *store
 		}
 	}
 
+	currentMSN := st.GetCurrentMSN()
+	currentPartIdx := st.GetCurrentPartIndex()
+	hasIt := st.HasPartOrSegment(targetMSN, targetPart)
+	zlog.Debug().
+		Int("req_msn", targetMSN).
+		Int("req_part", targetPart).
+		Int("store_current_msn", currentMSN).
+		Int("store_current_part_idx", currentPartIdx).
+		Bool("available", hasIt).
+		Msg("blocking playlist reload")
+
 	// Per spec: if MSN is more than 2 ahead of current, return 400.
-	if targetMSN > st.GetCurrentMSN()+2 {
+	if targetMSN > currentMSN+2 {
+		zlog.Warn().
+			Int("req_msn", targetMSN).
+			Int("store_current_msn", currentMSN).
+			Msg("playlist request: MSN too far in the future")
 		http.Error(w, "MSN too far in the future", http.StatusBadRequest)
 		return
 	}
 
 	// Already available — serve immediately.
-	if st.HasPartOrSegment(targetMSN, targetPart) {
+	if hasIt {
 		generatePlaylist()
 		return
 	}
@@ -745,6 +773,11 @@ func (s *Server) servePlaylist(w http.ResponseWriter, r *http.Request, st *store
 	defer cancelWatch()
 
 	if err := st.Notifier().WaitFor(ctx, targetMSN, targetPart); err != nil {
+		zlog.Debug().
+			Int("req_msn", targetMSN).
+			Int("req_part", targetPart).
+			Err(err).
+			Msg("playlist wait failed")
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			http.Error(w, "timeout waiting for segment", http.StatusServiceUnavailable)
 		}
@@ -793,7 +826,19 @@ func (s *Server) servePart(w http.ResponseWriter, r *http.Request, st *store.Sto
 		return
 	}
 
-	if !st.HasPart(msn, partIdx) {
+	currentMSN := st.GetCurrentMSN()
+	currentPartIdx := st.GetCurrentPartIndex()
+	hasIt := st.HasPart(msn, partIdx)
+	zlog.Debug().
+		Str("requested_part", name).
+		Int("req_msn", msn).
+		Int("req_part_idx", partIdx).
+		Int("store_current_msn", currentMSN).
+		Int("store_current_part_idx", currentPartIdx).
+		Bool("part_available", hasIt).
+		Msg("player requested part")
+
+	if !hasIt {
 		timeout := time.Duration(s.cfg.SegmentDuration*3) * time.Second
 		ctx, cancel := context.WithTimeout(r.Context(), timeout)
 		defer cancel()
@@ -801,7 +846,18 @@ func (s *Server) servePart(w http.ResponseWriter, r *http.Request, st *store.Sto
 		cancelWatch := st.Notifier().OnContextCancel(ctx)
 		defer cancelWatch()
 
+		zlog.Debug().
+			Int("req_msn", msn).
+			Int("req_part_idx", partIdx).
+			Dur("timeout", timeout).
+			Msg("blocking wait for part")
+
 		if err := st.Notifier().WaitFor(ctx, msn, partIdx); err != nil {
+			zlog.Debug().
+				Int("req_msn", msn).
+				Int("req_part_idx", partIdx).
+				Err(err).
+				Msg("wait for part failed")
 			if ctx.Err() == context.DeadlineExceeded {
 				http.Error(w, "timeout waiting for part", http.StatusServiceUnavailable)
 			}
@@ -811,9 +867,18 @@ func (s *Server) servePart(w http.ResponseWriter, r *http.Request, st *store.Sto
 
 	part := st.GetPart(msn, partIdx)
 	if part == nil {
+		zlog.Warn().
+			Int("req_msn", msn).
+			Int("req_part_idx", partIdx).
+			Msg("part still nil after wait — returning 404")
 		http.NotFound(w, r)
 		return
 	}
+	zlog.Debug().
+		Int("msn", msn).
+		Int("part_idx", partIdx).
+		Int("bytes", len(part.Data)).
+		Msg("serving part")
 	w.Header().Set("Content-Type", "video/mp4")
 	w.Header().Set("Cache-Control", "max-age=60")
 	if _, err := w.Write(part.Data); err != nil {
