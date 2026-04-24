@@ -44,6 +44,16 @@ func (dw *DiskWriter) WriteInit(data []byte) {
 	dw.writeFile("init.mp4", data)
 }
 
+// WritePart writes a completed LL-HLS partial segment to disk as
+// part-{MSN}-{index}.m4s. No playlist is updated; the playlist is only
+// refreshed when a full segment completes via WriteSegment.
+// Called synchronously from store.finalizePart (when the segment is not also
+// being finalized in the same call).
+func (dw *DiskWriter) WritePart(part *Part) {
+	filename := fmt.Sprintf("part-%d-%d.m4s", part.SegmentMSN, part.Index)
+	dw.writeFile(filename, part.Data)
+}
+
 // WriteSegment writes a completed segment to disk immediately as segment-N.m4s
 // and updates the playlist file.
 // Called synchronously from store.finalizeSegment.
@@ -79,6 +89,15 @@ func (dw *DiskWriter) Finalize() {
 
 	log.Printf("[disk_writer] finalized: %.3fs, %d segment(s) -> %s",
 		totalDuration, len(segs), dw.playlistName)
+}
+
+// ReadPart reads the part file part-{msn}-{partIdx}.m4s from disk and
+// returns its bytes. Returns an error if the file does not exist or cannot
+// be read.
+func (dw *DiskWriter) ReadPart(msn, partIdx int) ([]byte, error) {
+	filename := fmt.Sprintf("part-%d-%d.m4s", msn, partIdx)
+	path := filepath.Join(dw.dir, filename)
+	return os.ReadFile(path)
 }
 
 func (dw *DiskWriter) writeFile(name string, data []byte) {

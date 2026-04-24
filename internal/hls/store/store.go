@@ -4,8 +4,6 @@ import (
 	"sync"
 	"time"
 	"vt-stream-transcoder/internal/config"
-
-	zlog "github.com/rs/zerolog/log"
 )
 
 // partAccumulator collects fMP4 fragments until enough duration has
@@ -30,6 +28,8 @@ type Store struct {
 	diskWriter       *DiskWriter // optional; nil means no disk output
 	SegmentDurationD time.Duration
 	PartHoldBack     float64
+	StreamStartTime  time.Time
+	ended            bool // set by Finalize; causes EXT-X-ENDLIST in playlist
 }
 
 // Snapshot is an immutable copy of store state for playlist generation.
@@ -37,6 +37,8 @@ type Snapshot struct {
 	Init           *InitSegment
 	Segments       []*Segment // window of completed segments
 	CurrentSegment *Segment   // in-progress segment (may be nil before stream starts)
+	StreamStart    time.Time
+	Ended          bool // true after Finalize(); triggers EXT-X-ENDLIST
 }
 
 // NewStore creates a Store with the given configuration.
@@ -54,6 +56,13 @@ func (s *Store) Notifier() *Notifier {
 	return s.notifier
 }
 
+// GetDiskWriter returns the attached DiskWriter, or nil if none was set.
+func (s *Store) GetDiskWriter() *DiskWriter {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.diskWriter
+}
+
 // SetDiskWriter attaches a DiskWriter to the store.
 // Must be called before streaming begins (before SetInit is called).
 func (s *Store) SetDiskWriter(dw *DiskWriter) {
@@ -69,6 +78,7 @@ func (s *Store) SetInit(data []byte) {
 	copy(cp, data)
 	s.init = &InitSegment{Data: cp}
 	dw := s.diskWriter
+	s.StreamStartTime = time.Now()
 	s.mu.Unlock()
 
 	if dw != nil {
@@ -107,15 +117,15 @@ func (s *Store) AddFragment(data []byte, durationSec float64, isKeyframe bool) {
 	s.currentPart.data = append(s.currentPart.data, data...)
 	s.currentPart.duration += durationSec
 
-	zlog.Debug().
-		Int("frag_bytes", len(data)).
-		Float64("frag_duration_sec", durationSec).
-		Bool("keyframe", isKeyframe).
-		Int("current_msn", s.currentSeg.MSN).
-		Float64("accumulated_part_duration", s.currentPart.duration).
-		Float64("part_duration_target", s.cfg.PartDuration).
-		Int("parts_in_seg", len(s.currentSeg.Parts)).
-		Msg("store: fragment added")
+	//zlog.Debug().
+	//	Int("frag_bytes", len(data)).
+	//	Float64("frag_duration_sec", durationSec).
+	//	Bool("keyframe", isKeyframe).
+	//	Int("current_msn", s.currentSeg.MSN).
+	//	Float64("accumulated_part_duration", s.currentPart.duration).
+	//	Float64("part_duration_target", s.cfg.PartDuration).
+	//	Int("parts_in_seg", len(s.currentSeg.Parts)).
+	//	Msg("store: fragment added")
 
 	// Finalize the part if enough duration has accumulated, capturing any
 	// pending broadcast so we can fire it after releasing the lock.
@@ -154,15 +164,15 @@ func (s *Store) finalizePart() (broadcastMSN, broadcastPart int, ok bool) {
 	s.currentSeg.Data = append(s.currentSeg.Data, part.Data...)
 	s.currentPart = nil
 
-	zlog.Debug().
-		Int("msn", part.SegmentMSN).
-		Int("part_idx", part.Index).
-		Int("part_bytes", len(part.Data)).
-		Int64("part_duration_ms", part.Duration).
-		Bool("independent", part.Independent).
-		Int64("seg_duration_ms", s.currentSeg.Duration).
-		Int64("seg_duration_target_ms", s.SegmentDurationD.Milliseconds()).
-		Msg("store: part finalized")
+	//zlog.Debug().
+	//	Int("msn", part.SegmentMSN).
+	//	Int("part_idx", part.Index).
+	//	Int("part_bytes", len(part.Data)).
+	//	Int64("part_duration_ms", part.Duration).
+	//	Bool("independent", part.Independent).
+	//	Int64("seg_duration_ms", s.currentSeg.Duration).
+	//	Int64("seg_duration_target_ms", s.SegmentDurationD.Milliseconds()).
+	//	Msg("store: part finalized")
 
 	broadcastMSN = s.currentSeg.MSN
 	broadcastPart = part.Index
@@ -171,6 +181,12 @@ func (s *Store) finalizePart() (broadcastMSN, broadcastPart int, ok bool) {
 	// broadcast supersedes the part broadcast.
 	if s.currentSeg.Duration >= s.SegmentDurationD.Milliseconds() {
 		broadcastMSN, broadcastPart = s.finalizeSegment()
+	}
+
+	// Write the part to disk only when the segment was not also finalized;
+	// finalizeSegment already writes the full segment file which contains all parts.
+	if s.diskWriter != nil {
+		s.diskWriter.WritePart(part)
 	}
 
 	return broadcastMSN, broadcastPart, true
@@ -184,22 +200,22 @@ func (s *Store) finalizeSegment() (broadcastMSN, broadcastPart int) {
 		return 0, 0
 	}
 
-	zlog.Debug().
-		Int("msn", s.currentSeg.MSN).
-		Int("parts", len(s.currentSeg.Parts)).
-		Int64("duration_ms", s.currentSeg.Duration).
-		Int("total_completed_segs", len(s.segments)).
-		Msg("store: segment finalized")
+	//zlog.Debug().
+	//	Int("msn", s.currentSeg.MSN).
+	//	Int("parts", len(s.currentSeg.Parts)).
+	//	Int64("duration_ms", s.currentSeg.Duration).
+	//	Int("total_completed_segs", len(s.segments)).
+	//	Msg("store: segment finalized")
 
 	s.currentSeg.Completed = true
 	completedSeg := s.currentSeg
 	s.segments = append(s.segments, s.currentSeg)
 
 	// Trim window.
-	if len(s.segments) > s.cfg.PlaylistWindow {
-		s.segments = s.segments[len(s.segments)-s.cfg.PlaylistWindow:]
+	if len(s.segments) >= s.cfg.PlaylistWindow {
+		s.segments = s.segments[1:]
 	}
-
+	//
 	completedMSN := s.currentSeg.MSN
 	// Start fresh segment.
 	s.currentSeg = &Segment{
@@ -215,9 +231,10 @@ func (s *Store) finalizeSegment() (broadcastMSN, broadcastPart int) {
 	return completedMSN, -1
 }
 
-// Finalize forces any in-progress part and segment to be closed, then
-// instructs the disk writer (if any) to write the final EXT-X-ENDLIST
-// playlist. Call this after the encoding pipeline has been fully flushed.
+// Finalize forces any in-progress part and segment to be closed, marks the
+// stream as ended (so the next playlist response includes #EXT-X-ENDLIST),
+// and instructs the disk writer (if any) to write the final playlist.
+// Call this after the encoding pipeline has been fully flushed.
 func (s *Store) Finalize() {
 	s.mu.Lock()
 	var pendingMSN, pendingPart int
@@ -229,11 +246,17 @@ func (s *Store) Finalize() {
 		pendingMSN, pendingPart = s.finalizeSegment()
 		hasPending = true
 	}
+	s.ended = true
 	dw := s.diskWriter
 	s.mu.Unlock()
 
+	// Always broadcast after marking ended so that any clients blocked on a
+	// blocking playlist reload (WaitFor) are woken and can read the final
+	// playlist containing #EXT-X-ENDLIST.
 	if hasPending {
 		s.notifier.Broadcast(pendingMSN, pendingPart)
+	} else {
+		s.notifier.BroadcastEnded()
 	}
 	if dw != nil {
 		dw.Finalize()
@@ -332,6 +355,9 @@ func (s *Store) Snapshot() Snapshot {
 	if s.init != nil {
 		snap.Init = s.init
 	}
+
+	snap.StreamStart = s.StreamStartTime
+	snap.Ended = s.ended
 
 	// Copy completed segments slice.
 	snap.Segments = make([]*Segment, len(s.segments))

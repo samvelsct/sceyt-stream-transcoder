@@ -17,10 +17,14 @@ import (
 	"vt-stream-transcoder/internal/config"
 	"vt-stream-transcoder/internal/httpserver"
 	"vt-stream-transcoder/internal/server"
+	"vt-stream-transcoder/internal/webrtchls"
 
+	zlog "github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
+	"google.golang.org/grpc/status"
 )
 
 var (
@@ -29,6 +33,40 @@ var (
 	hlsAddr    = flag.String("hls-addr", ":8080", "Address for the LL-HLS HTTP server")
 	showConfig = flag.Bool("show-config", false, "Show current configuration and exit")
 )
+
+type sessionIDGetter interface {
+	GetSessionId() string
+}
+
+func grpcDurationInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+	start := time.Now()
+	resp, err := handler(ctx, req)
+	durationMs := float64(time.Since(start).Microseconds()) / 1000.0
+
+	code := codes.OK
+	if err != nil {
+		if s, ok := status.FromError(err); ok {
+			code = s.Code()
+		} else {
+			code = codes.Unknown
+		}
+	}
+
+	event := zlog.Info().
+		Str("method", info.FullMethod).
+		Float64("duration_ms", durationMs).
+		Str("code", code.String())
+
+	if r, ok := req.(sessionIDGetter); ok {
+		if sid := r.GetSessionId(); sid != "" {
+			event = event.Str("session_id", sid)
+		}
+	}
+
+	event.Msg("grpc request")
+
+	return resp, err
+}
 
 func startHealthCheck() {
 	go func() {
@@ -98,6 +136,29 @@ func main() {
 		log.Fatalf("Invalid configuration: %v", err)
 	}
 
+	// Apply log level to the C library.
+	// Use lib_level when set, otherwise fall back to the app log level.
+	libLogLevel := cfg.Logging.LibLevel
+	if libLogLevel == "" {
+		libLogLevel = cfg.Logging.Level
+	}
+	switch libLogLevel {
+	case "debug":
+		webrtchls.SetLogLevel(webrtchls.LogLevelDebug)
+	case "warn":
+		webrtchls.SetLogLevel(webrtchls.LogLevelWarn)
+	case "error":
+		webrtchls.SetLogLevel(webrtchls.LogLevelError)
+	default:
+		webrtchls.SetLogLevel(webrtchls.LogLevelInfo)
+	}
+
+	if cfg.Logging.Format == "text" {
+		webrtchls.SetLogFormat(webrtchls.LogFormatText)
+	} else {
+		webrtchls.SetLogFormat(webrtchls.LogFormatJSON)
+	}
+
 	// Show config and exit if requested
 	if *showConfig {
 		fmt.Println("Current Configuration:")
@@ -114,6 +175,7 @@ func main() {
 		fmt.Printf("\n  Log Level: %s\n", cfg.Logging.Level)
 		fmt.Printf("  Log Format: %s\n", cfg.Logging.Format)
 		fmt.Printf("  Log Output: %s\n", cfg.Logging.Output)
+		fmt.Printf("\n  Lib Log Level: %s\n", cfg.Logging.LibLevel)
 		return
 	}
 
@@ -157,6 +219,7 @@ func main() {
 			Time:    cfg.Server.ConnectionTimeout,
 			Timeout: cfg.Server.ConnectionTimeout / 2,
 		}),
+		grpc.UnaryInterceptor(grpcDurationInterceptor),
 	}
 	grpcServer := grpc.NewServer(grpcOpts...)
 	pb.RegisterStreamBridgeServer(grpcServer, streamBridgeServer)
@@ -183,6 +246,7 @@ func main() {
 	log.Printf("  HLS Output: %s", cfg.HLS.OutputDir)
 	log.Printf("  Janus Gateway: %s", cfg.Janus.GatewayAddress)
 	log.Printf("  Log Level: %s", cfg.Logging.Level)
+	log.Printf("  Lib Log Level: %s", cfg.Logging.LibLevel)
 	log.Println("Ready to receive commands for WebRTC to HLS conversion")
 
 	if err := grpcServer.Serve(lis); err != nil {

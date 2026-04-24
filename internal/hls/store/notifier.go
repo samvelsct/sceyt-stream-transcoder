@@ -11,7 +11,8 @@ type Notifier struct {
 	mu       sync.Mutex
 	cond     *sync.Cond
 	lastMSN  int
-	lastPart int // -1 means a full segment was completed
+	lastPart int  // -1 means a full segment was completed
+	ended    bool // set by BroadcastEnded; unblocks all WaitFor calls
 }
 
 // NewNotifier creates a Notifier with initial state at MSN -1.
@@ -31,6 +32,15 @@ func (n *Notifier) Broadcast(msn, partIdx int) {
 	n.mu.Unlock()
 }
 
+// BroadcastEnded marks the stream as ended and wakes all blocked WaitFor
+// calls so they can return and serve the final #EXT-X-ENDLIST playlist.
+func (n *Notifier) BroadcastEnded() {
+	n.mu.Lock()
+	n.ended = true
+	n.cond.Broadcast()
+	n.mu.Unlock()
+}
+
 // WaitFor blocks until the store contains at least segment targetMSN and
 // (if targetPart >= 0) part targetPart of that segment.
 // Returns ctx.Err() if the context is cancelled before the condition is met.
@@ -41,6 +51,9 @@ func (n *Notifier) WaitFor(ctx context.Context, targetMSN, targetPart int) error
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if n.ended {
+			return nil // stream ended; caller should serve EXT-X-ENDLIST playlist
 		}
 		if n.lastMSN > targetMSN {
 			return nil // segment is already complete
@@ -68,7 +81,9 @@ func (n *Notifier) OnContextCancel(ctx context.Context) (cancel func()) {
 	go func() {
 		select {
 		case <-ctx.Done():
+			n.mu.Lock()
 			n.cond.Broadcast()
+			n.mu.Unlock()
 		case <-done:
 		}
 	}()

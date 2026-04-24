@@ -49,18 +49,23 @@ hls:
   enable_gstreamer: false
 
   # Output video width in pixels (default: 1280)
-  width: 540
+  width: 360
 
   # Output video height in pixels (default: 720)
-  height: 960
+  height: 640
 
   # Output frames per second (default: 30)
   fps: 20
 
+  write_on_disk: true
+
 # Logging Configuration
 logging:
-  # Log level: debug, info, warn, error (default: info)
-  level: "info"
+  # Application log level: debug, info, warn, error (default: info)
+  level: "debug"
+
+  # C library log level: debug, info, warn, error (default: falls back to level)
+  lib_level: "info"
 
   # Log format: text, json (default: text)
   format: "text"

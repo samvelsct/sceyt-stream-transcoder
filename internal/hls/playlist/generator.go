@@ -36,13 +36,21 @@ func generate(snap store.Snapshot, segmentDuration float64, partDuration float64
 	// every segment satisfies the spec constraint.
 	targetDuration := int(segmentDuration)
 	fmt.Fprintf(&b, "#EXT-X-TARGETDURATION:%d\n", targetDuration)
-	// CAN-SKIP-UNTIL must be >= 6 × TARGETDURATION (not 6 × SegmentDuration).
-	// draft-pantos-hls-rfc8216bis-20 §4.4.3.8: "The Skip Boundary MUST be
-	// at least six times the Target Duration."
+
+	// CAN-SKIP-UNTIL must be >= 6 × TARGETDURATION per spec, but must not
+	// exceed the actual content held in the playlist window. Cap it to the
+	// lesser of the two so clients never try to skip past what we have.
+	minSkipUntil := float64(targetDuration) * 6
+	actualWindowSec := float64(len(snap.Segments)) * segmentDuration
+	canSkipUntilSec := minSkipUntil
+	if actualWindowSec < minSkipUntil {
+		canSkipUntilSec = actualWindowSec
+	}
 	fmt.Fprintf(&b,
-		"#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=%.3f,CAN-SKIP-UNTIL=%.3f\n",
+		"#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,HOLD-BACK=%.3f,PART-HOLD-BACK=%.3f,CAN-SKIP-UNTIL=%.3f\n",
+		segmentDuration*3,
 		partHoldBack,
-		float64(targetDuration)*6,
+		minSkipUntil,
 	)
 	fmt.Fprintf(&b, "#EXT-X-PART-INF:PART-TARGET=%.3f\n", partDuration)
 
@@ -50,10 +58,7 @@ func generate(snap store.Snapshot, segmentDuration float64, partDuration float64
 	// EXT-X-SKIP: compute skipped count before writing EXT-X-MEDIA-SEQUENCE
 	// because the sequence number must reflect the first segment that is
 	// actually present in the playlist (i.e. after the skip).
-	// Per spec, CAN-SKIP-UNTIL = 6 × TARGETDURATION. segsToKeep is derived
-	// from actual SegmentDuration so it stays correct for any segment length.
 	// -----------------------------------------------------------------------
-	canSkipUntilSec := float64(targetDuration) * 6
 	segsToKeep := int(math.Ceil(canSkipUntilSec / segmentDuration))
 	skippedCount := 0
 	segStart := 0
@@ -106,8 +111,11 @@ func generate(snap store.Snapshot, segmentDuration float64, partDuration float64
 
 	// -----------------------------------------------------------------------
 	// In-progress segment: show completed parts + preload hint
+	// (omitted when the stream has ended)
 	// -----------------------------------------------------------------------
-	if snap.CurrentSegment != nil {
+	if snap.Ended {
+		b.WriteString("#EXT-X-ENDLIST\n")
+	} else if snap.CurrentSegment != nil {
 		cur := snap.CurrentSegment
 
 		for _, part := range cur.Parts {

@@ -7,13 +7,13 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sync"
+	"vt-stream-transcoder/internal/webrtchls"
 
 	pb "vt-stream-transcoder/api"
 	"vt-stream-transcoder/internal/config"
 	"vt-stream-transcoder/internal/httpserver"
 
 	zlog "github.com/rs/zerolog/log"
-	"github.com/samvelsct/go-webrtchls/webrtchls"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -100,7 +100,7 @@ func (s *Server) Close() {
 }
 
 // CreateSession creates a new HLS output session
-func (s *Server) CreateSession(ctx context.Context, req *pb.CreateSessionRequest) (*pb.CreateSessionResponse, error) {
+func (s *Server) CreateSession(_ context.Context, req *pb.CreateSessionRequest) (*pb.CreateSessionResponse, error) {
 	zlog.Info().Msgf("CreateSessionRequest: %v", req)
 	if req.SessionId == "" {
 		return &pb.CreateSessionResponse{
@@ -180,7 +180,7 @@ func (s *Server) CreateSession(ctx context.Context, req *pb.CreateSessionRequest
 }
 
 // DestroySession destroys an existing session
-func (s *Server) DestroySession(ctx context.Context, req *pb.DestroySessionRequest) (*pb.DestroySessionResponse, error) {
+func (s *Server) DestroySession(_ context.Context, req *pb.DestroySessionRequest) (*pb.DestroySessionResponse, error) {
 	zlog.Info().Msgf("DestroySession: %v", req)
 
 	s.mu.Lock()
@@ -235,7 +235,7 @@ func (s *Server) DestroySession(ctx context.Context, req *pb.DestroySessionReque
 }
 
 // AddInput adds a WebRTC input to a session
-func (s *Server) AddInput(ctx context.Context, req *pb.AddInputRequest) (*pb.AddInputResponse, error) {
+func (s *Server) AddInput(_ context.Context, req *pb.AddInputRequest) (*pb.AddInputResponse, error) {
 	zlog.Info().Msgf("AddInput: %v", req)
 
 	s.mu.RLock()
@@ -305,7 +305,7 @@ func (s *Server) AddInput(ctx context.Context, req *pb.AddInputRequest) (*pb.Add
 }
 
 // RemoveInput removes a WebRTC input from a session
-func (s *Server) RemoveInput(ctx context.Context, req *pb.RemoveInputRequest) (*pb.RemoveInputResponse, error) {
+func (s *Server) RemoveInput(_ context.Context, req *pb.RemoveInputRequest) (*pb.RemoveInputResponse, error) {
 	zlog.Info().Msgf("RemoveInput: %v", req)
 
 	s.mu.RLock()
@@ -335,7 +335,7 @@ func (s *Server) RemoveInput(ctx context.Context, req *pb.RemoveInputRequest) (*
 }
 
 // SetMute sets the mute status for a participant
-func (s *Server) SetMute(ctx context.Context, req *pb.SetMuteRequest) (*pb.SetMuteResponse, error) {
+func (s *Server) SetMute(_ context.Context, req *pb.SetMuteRequest) (*pb.SetMuteResponse, error) {
 	s.mu.RLock()
 	session, exists := s.sessions[req.SessionId]
 	s.mu.RUnlock()
@@ -362,7 +362,7 @@ func (s *Server) SetMute(ctx context.Context, req *pb.SetMuteRequest) (*pb.SetMu
 }
 
 // SetVideoOn sets the video on/off status for a participant
-func (s *Server) SetVideoOn(ctx context.Context, req *pb.SetVideoOnRequest) (*pb.SetVideoOnResponse, error) {
+func (s *Server) SetVideoOn(_ context.Context, req *pb.SetVideoOnRequest) (*pb.SetVideoOnResponse, error) {
 	s.mu.RLock()
 	session, exists := s.sessions[req.SessionId]
 	s.mu.RUnlock()
@@ -389,7 +389,7 @@ func (s *Server) SetVideoOn(ctx context.Context, req *pb.SetVideoOnRequest) (*pb
 }
 
 // WriteID3Tag writes a custom ID3 tag to the HLS stream
-func (s *Server) WriteID3Tag(ctx context.Context, req *pb.WriteID3TagRequest) (*pb.WriteID3TagResponse, error) {
+func (s *Server) WriteID3Tag(_ context.Context, req *pb.WriteID3TagRequest) (*pb.WriteID3TagResponse, error) {
 	s.mu.RLock()
 	session, exists := s.sessions[req.SessionId]
 	s.mu.RUnlock()
@@ -416,7 +416,7 @@ func (s *Server) WriteID3Tag(ctx context.Context, req *pb.WriteID3TagRequest) (*
 }
 
 // GetSessionInfo retrieves information about a session
-func (s *Server) GetSessionInfo(ctx context.Context, req *pb.GetSessionInfoRequest) (*pb.GetSessionInfoResponse, error) {
+func (s *Server) GetSessionInfo(_ context.Context, req *pb.GetSessionInfoRequest) (*pb.GetSessionInfoResponse, error) {
 	s.mu.RLock()
 	session, exists := s.sessions[req.SessionId]
 	s.mu.RUnlock()

@@ -43,13 +43,15 @@ type HLSConfig struct {
 	Width           int     `yaml:"width"`
 	Height          int     `yaml:"height"`
 	FPS             int     `yaml:"fps"`
+	WriteOnDisk     bool    `yaml:"write_on_disk"`
 }
 
 // LoggingConfig holds logging configuration
 type LoggingConfig struct {
-	Level  string `yaml:"level"`
-	Format string `yaml:"format"`
-	Output string `yaml:"output"`
+	Level    string `yaml:"level"`
+	LibLevel string `yaml:"lib_level"` // log level for the C library; falls back to Level if empty
+	Format   string `yaml:"format"`
+	Output   string `yaml:"output"`
 }
 
 // Default returns a configuration with default values
@@ -76,6 +78,7 @@ func Default() *Config {
 			Width:           1280,
 			Height:          720,
 			FPS:             30,
+			WriteOnDisk:     false,
 		},
 		Logging: LoggingConfig{
 			Level:  "info",
@@ -203,6 +206,9 @@ func (c *Config) applyEnvironment() {
 	if level := os.Getenv("LOG_LEVEL"); level != "" {
 		c.Logging.Level = level
 	}
+	if libLevel := os.Getenv("LIB_LOG_LEVEL"); libLevel != "" {
+		c.Logging.LibLevel = libLevel
+	}
 	if format := os.Getenv("LOG_FORMAT"); format != "" {
 		c.Logging.Format = format
 	}
@@ -248,6 +254,9 @@ func (c *Config) Validate() error {
 	}
 	if !validLogLevels[c.Logging.Level] {
 		return fmt.Errorf("invalid log level: %s", c.Logging.Level)
+	}
+	if c.Logging.LibLevel != "" && !validLogLevels[c.Logging.LibLevel] {
+		return fmt.Errorf("invalid lib log level: %s", c.Logging.LibLevel)
 	}
 
 	return nil

@@ -44,7 +44,7 @@ COPY go.mod go.sum* ./
 RUN go mod download
 
 # Copy shared library for build
-COPY ./libwebrtc_hls.so /usr/local/lib/
+COPY ./c-wrapper/lib/libwebrtc_hls.so /usr/local/lib/
 RUN ldconfig
 
 # Copy source code
@@ -80,7 +80,7 @@ WORKDIR /root/
 COPY --from=builder /build/app .
 
 # Copy shared library
-COPY ./libwebrtc_hls.so /usr/local/lib/
+COPY ./c-wrapper/lib/libwebrtc_hls.so /usr/local/lib/
 RUN ldconfig
 
 # Copy config file
