@@ -3,7 +3,6 @@ bin/
 *.exe
 *.exe~
 *.dll
-*.so
 *.dylib
 
 # Test binary, built with `go test -c`
@@ -39,3 +38,4 @@ Thumbs.db
 
 # Environment files
 .env
+/localserver.crt
