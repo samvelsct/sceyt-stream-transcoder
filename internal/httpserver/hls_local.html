@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>LL-HLS Multi-Input Portrait Player</title>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+    <style>
+        #container {
+            position: relative;
+            width: 400px; /* portrait width */
+            height: 600px; /* portrait height */
+            max-width: 100%;
+        }
+        #video {
+            width: 100%;
+            height: 100%;
+            display: block;
+            object-fit: cover;
+        }
+        #overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+<h1>LL-HLS Multi-Input Portrait Player</h1>
+
+<label>Session ID: <input id="sid"></label>
+<button onclick="loadStream()">Load Stream</button>
+<br><br>
+<div>Program Date Time: <span id="pdt">—</span></div>
+<br>
+
+<div id="container">
+    <video id="video" controls autoplay muted></video>
+    <canvas id="overlay"></canvas>
+</div>
+
+<script>
+    let hls;
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('overlay');
+    const ctx = canvas.getContext('2d');
+
+    const pendingEvents = []; // { pts: seconds relative to stream start, type, data }
+    let activeInputs = [];
+    let programDateTimeS = null; // Unix seconds from first #EXT-X-PROGRAM-DATE-TIME
+
+
+    // Parse ID3v2 tag bytes and return array of { description, value } from TXXX/PRIV/T* frames
+    function parseID3Text(data) {
+        const bytes = new Uint8Array(data);
+        // Must start with "ID3"
+        if (bytes[0] !== 0x49 || bytes[1] !== 0x44 || bytes[2] !== 0x33) {
+            // Not a valid ID3 header — fall back to raw decode
+            return [{ description: '', value: new TextDecoder().decode(data) }];
+        }
+        // ID3v2 header: 3 bytes "ID3" + 2 bytes version + 1 byte flags + 4 bytes syncsafe size
+        const size = ((bytes[6] & 0x7f) << 21) | ((bytes[7] & 0x7f) << 14) |
+                     ((bytes[8] & 0x7f) << 7)  |  (bytes[9] & 0x7f);
+        let offset = 10;
+        const end = Math.min(10 + size, bytes.length);
+        const frames = [];
+
+        while (offset + 10 < end) {
+            const frameId = String.fromCharCode(bytes[offset], bytes[offset+1], bytes[offset+2], bytes[offset+3]);
+            const frameSize = (bytes[offset+4] << 24) | (bytes[offset+5] << 16) |
+                              (bytes[offset+6] << 8)  |  bytes[offset+7];
+            offset += 10; // skip frame header (4 id + 4 size + 2 flags)
+            if (frameSize <= 0 || offset + frameSize > end) break;
+
+            const frameData = bytes.slice(offset, offset + frameSize);
+
+            if (frameId === 'TXXX' || frameId === 'PRIV' ||
+                frameId[0] === 'T' || frameId === 'WFED') {
+                // First byte is text encoding: 0=latin1, 1=utf16, 2=utf16be, 3=utf8
+                const enc = frameData[0];
+                let decoder;
+                if (enc === 1) decoder = new TextDecoder('utf-16');
+                else if (enc === 2) decoder = new TextDecoder('utf-16be');
+                else decoder = new TextDecoder('utf-8');
+
+                let descEnd = 1;
+                let description = '';
+
+                // TXXX/PRIV have a null-terminated description before the value
+                if (frameId === 'TXXX' || frameId === 'PRIV') {
+                    const step = enc === 1 ? 2 : 1;
+                    while (descEnd + step <= frameData.length) {
+                        if (enc === 1) {
+                            if (frameData[descEnd] === 0 && frameData[descEnd+1] === 0) { descEnd += 2; break; }
+                        } else {
+                            if (frameData[descEnd] === 0) { descEnd += 1; break; }
+                        }
+                        descEnd += step;
+                    }
+                    description = decoder.decode(frameData.slice(1, descEnd - (enc === 1 ? 2 : 1)));
+                }
+
+                const value = decoder.decode(frameData.slice(descEnd));
+                frames.push({ description, value });
+            }
+            offset += frameSize;
+        }
+        return frames;
+    }
+    function safeParseMetadata(raw) {
+        try {
+            const clean = raw
+                .replace(/\0/g, '')     // remove null bytes
+                .trim();
+
+            return JSON.parse(clean);
+        } catch (e) {
+            console.error('Invalid JSON in metadata:', e, raw);
+            return null;
+        }
+    }
+    // Extract add/remove input events from ID3
+    function handleID3Metadata(sample) {
+        const frames = parseID3Text(sample.data);
+        frames.forEach(({ description, value }) => {
+            try {
+                const parsedValue = safeParseMetadata(value)
+                console.log('ID3 frame description:', description, 'value:', parsedValue);
+                if (description === 'participants') {
+                    pendingEvents.push({
+                        pts: sample.pts,
+                        type: 'snapshot',
+                        data: parsedValue.sort((a, b) => a.idx - b.idx)
+                    });
+                } else if (description === 'add-input') {
+                    pendingEvents.push({
+                        pts: sample.pts,
+                        type: 'add',
+                        data: parsedValue
+                    });
+                } else if (description === 'remove-input') {
+                    pendingEvents.push({
+                        pts: sample.pts,
+                        type: 'remove',
+                        data: parsedValue
+                    });
+                } else if (description === 'mute') {
+                    pendingEvents.push({
+                        pts: sample.pts,
+                        type: 'mute',
+                        data: parsedValue
+                    });
+                } else if (description === 'video-on') {
+                    pendingEvents.push({
+                        pts: sample.pts,
+                        type: 'video-on',
+                        data: parsedValue
+                    });
+                }
+            } catch(e) {
+                console.warn("Invalid JSON in metadata", e);
+            }
+        });
+
+        pendingEvents.sort((a,b) => a.pts - b.pts);
+    }
+
+    // --- Frame loop for frame-accurate updates ---
+    function frameLoop(now, metadata) {
+        const currentTime = metadata.mediaTime;
+
+        // Apply pending events
+        for (let index = 0; index < pendingEvents.length; index++) {
+            if (pendingEvents[index].pts > currentTime) {
+                continue
+            }
+            console.log('I am in current time yet',pendingEvents[index].pts, currentTime, pendingEvents)
+            const evt = pendingEvents.shift();
+            if (evt.type === 'snapshot') {
+                activeInputs = evt.data;
+            } else if (evt.type === 'add') {
+                if (!activeInputs.find(i => i.user_id === evt.data.user_id)) {
+                    activeInputs.push(evt.data);
+                }
+            } else if (evt.type === 'remove') {
+                activeInputs = activeInputs.filter(i => i.user_id !== evt.data.user_id);
+            } else if (evt.type === 'mute') {
+                const input = activeInputs.find(i => i.user_id === evt.data.user_id);
+                if (input) input.mute = evt.data.mute;
+            } else if (evt.type === 'video-on') {
+                const input = activeInputs.find(i => i.user_id === evt.data.user_id);
+                if (input) input.video_on = evt.data.video_on;
+            }
+            index++
+        }
+
+        drawInputs();
+        video.requestVideoFrameCallback(frameLoop);
+    }
+
+    // --- Draw active inputs with red border ---
+    function drawInputs() {
+        // Sync canvas internal resolution to its displayed size
+        const container = document.getElementById('container');
+        const cw = container.clientWidth;
+        const ch = container.clientHeight;
+        if (canvas.width !== cw || canvas.height !== ch) {
+            canvas.width = cw;
+            canvas.height = ch;
+        }
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        const count = activeInputs.length;
+        if (count === 0) return;
+
+        const positions = [];
+
+        // Portrait layout logic
+        if (count === 1) {
+            positions.push({ x:0, y:0, w:canvas.width, h:canvas.height });
+        } else if (count === 2) {
+            positions.push({ x:0, y:0, w:canvas.width, h:canvas.height/2 });
+            positions.push({ x:0, y:canvas.height/2, w:canvas.width, h:canvas.height/2 });
+        } else if (count === 3) {
+            positions.push({ x:0, y:0, w:canvas.width/2, h:canvas.height/2 });
+            positions.push({ x:canvas.width/2, y:0, w:canvas.width/2, h:canvas.height/2 });
+            positions.push({ x:0, y:canvas.height/2, w:canvas.width, h:canvas.height/2 });
+        } else if (count >= 4) {
+            positions.push({ x:0, y:0, w:canvas.width/2, h:canvas.height/2 });
+            positions.push({ x:canvas.width/2, y:0, w:canvas.width/2, h:canvas.height/2 });
+            positions.push({ x:0, y:canvas.height/2, w:canvas.width/2, h:canvas.height/2 });
+            positions.push({ x:canvas.width/2, y:canvas.height/2, w:canvas.width/2, h:canvas.height/2 });
+        }
+
+        positions.forEach((pos, i) => {
+            if (!activeInputs[i]) return;
+
+            // Gray overlay + video-off icon when video is off
+            if (activeInputs[i].video_on === false) {
+                ctx.fillStyle = "rgba(60,60,60,1)";
+                ctx.fillRect(pos.x, pos.y, pos.w, pos.h);
+
+                // Camera-off icon (centered)
+                const cx = pos.x + pos.w / 2;
+                const cy = pos.y + pos.h / 2;
+                const s = Math.min(pos.w, pos.h) * 0.18; // icon scale
+
+                // Camera body
+                ctx.strokeStyle = "#fff";
+                ctx.lineWidth = s * 0.15;
+                ctx.beginPath();
+                ctx.roundRect(cx - s, cy - s * 0.65, s * 2, s * 1.3, s * 0.2);
+                ctx.stroke();
+                // Viewfinder triangle (right side)
+                ctx.beginPath();
+                ctx.moveTo(cx + s, cy - s * 0.4);
+                ctx.lineTo(cx + s * 1.5, cy - s * 0.7);
+                ctx.lineTo(cx + s * 1.5, cy + s * 0.7);
+                ctx.lineTo(cx + s, cy + s * 0.4);
+                ctx.stroke();
+                // Red diagonal slash across icon
+                ctx.strokeStyle = "#f00";
+                ctx.lineWidth = s * 0.18;
+                ctx.beginPath();
+                ctx.moveTo(cx - s * 1.3, cy - s);
+                ctx.lineTo(cx + s * 1.3, cy + s);
+                ctx.stroke();
+            }
+
+            // Draw user_id text
+            ctx.fillStyle = "#fff";
+            ctx.font = `bold 14px Arial`;
+            ctx.fillText(activeInputs[i].user_id || "unknown", pos.x + 10, pos.y + 30);
+
+            // Draw mute icon if muted
+            if (activeInputs[i].mute) {
+                const iconX = pos.x + pos.w - 36;
+                const iconY = pos.y + 8;
+                const r = 12;
+                // Background circle
+                ctx.fillStyle = "rgba(0,0,0,0.55)";
+                ctx.beginPath();
+                ctx.arc(iconX + r, iconY + r, r, 0, Math.PI * 2);
+                ctx.fill();
+                // Microphone body
+                ctx.strokeStyle = "#fff";
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.roundRect(iconX + 7, iconY + 2, 10, 14, 5);
+                ctx.stroke();
+                // Microphone stand arc
+                ctx.beginPath();
+                ctx.arc(iconX + r, iconY + 16, 6, Math.PI, 0, true);
+                ctx.stroke();
+                // Microphone stand line
+                ctx.beginPath();
+                ctx.moveTo(iconX + r, iconY + 22);
+                ctx.lineTo(iconX + r, iconY + 24);
+                ctx.stroke();
+                // Red diagonal slash
+                ctx.strokeStyle = "#f00";
+                ctx.lineWidth = 2.5;
+                ctx.beginPath();
+                ctx.moveTo(iconX + 4, iconY + 4);
+                ctx.lineTo(iconX + 20, iconY + 20);
+                ctx.stroke();
+            }
+        });
+
+        // Draw grid border lines on top of video
+        ctx.lineWidth = 4;
+        ctx.strokeStyle = 'red';
+
+        if (count === 2) {
+            // Horizontal divider
+            ctx.beginPath();
+            ctx.moveTo(0, canvas.height / 2);
+            ctx.lineTo(canvas.width, canvas.height / 2);
+            ctx.stroke();
+        } else if (count === 3) {
+            // Vertical divider (top half only)
+            ctx.beginPath();
+            ctx.moveTo(canvas.width / 2, 0);
+            ctx.lineTo(canvas.width / 2, canvas.height / 2);
+            ctx.stroke();
+            // Horizontal divider
+            ctx.beginPath();
+            ctx.moveTo(0, canvas.height / 2);
+            ctx.lineTo(canvas.width, canvas.height / 2);
+            ctx.stroke();
+        } else if (count >= 4) {
+            // Full cross
+            ctx.beginPath();
+            ctx.moveTo(canvas.width / 2, 0);
+            ctx.lineTo(canvas.width / 2, canvas.height);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(0, canvas.height / 2);
+            ctx.lineTo(canvas.width, canvas.height / 2);
+            ctx.stroke();
+        }
+
+        // Outer border
+        ctx.strokeRect(2, 2, canvas.width - 4, canvas.height - 4);
+    }
+
+    // Initialize HLS once on page load
+    function initHls() {
+        if (!Hls.isSupported()) return;
+
+        hls = new Hls({
+            lowLatencyMode: true,
+            liveSyncDurationCount: 1,
+            liveMaxLatencyDurationCount: 2,
+        });
+
+        hls.attachMedia(video);
+
+        hls.on(Hls.Events.FRAG_PARSING_METADATA, (event, data) => {
+            data.samples.forEach(sample => {
+                handleID3Metadata(sample);
+            });
+        });
+
+        hls.on(Hls.Events.LEVEL_UPDATED, (event, data) => {
+            const pdt = data.details.programDateTime;
+            if (pdt) {
+                document.getElementById('pdt').textContent = new Date(pdt).toISOString();
+                if (programDateTimeS === null) {
+                    programDateTimeS = pdt / 1000;
+                    console.log('programDateTimeS set:', programDateTimeS, new Date(pdt).toISOString());
+                }
+            }
+        });
+    }
+
+    // Load stream
+    function loadStream() {
+        const sid = document.getElementById('sid').value.trim();
+        if (!sid) return;
+        const src = 'http://localhost:8080/live/streams/' + sid + '/stream.m3u8';
+        // const src = 'https://mp-api-staging-htgcloud-region-02.waafi.com/live/streams/' + sid + '/stream.m3u8';
+        // const src = window.location.origin + '/live/streams/' + sid + '/stream.m3u8';
+
+        programDateTimeS = null;
+        pendingEvents.length = 0;
+        activeInputs = [];
+
+        if (hls) {
+            hls.loadSource(src);
+            video.play();
+        } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+            video.src = src;
+            video.play();
+        }
+
+        console.log('start frame loop');
+        video.requestVideoFrameCallback(frameLoop);
+    }
+
+    initHls();
+</script>
+</body>
+</html>
