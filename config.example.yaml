@@ -62,10 +62,10 @@ hls:
 # Logging Configuration
 logging:
   # Application log level: debug, info, warn, error (default: info)
-  level: "debug"
+  level: "error"
 
   # C library log level: debug, info, warn, error (default: falls back to level)
-  lib_level: "info"
+  lib_level: "debug"
 
   # Log format: text, json (default: text)
   format: "text"

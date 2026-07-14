@@ -25,6 +25,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"unsafe"
+
+	zlog "github.com/rs/zerolog/log"
 )
 
 // Error definitions
@@ -170,6 +172,7 @@ func (c *Context) CreateSession(config *SessionConfig) (*Session, error) {
 // Destroy destroys the session and stops HLS output.
 // All WebRTC inputs will be automatically stopped and removed.
 func (s *Session) Destroy() {
+	zlog.Info().Msgf("[%s] Destroy: destroy session", s.segmentCBID)
 	if s.handle != nil && s.ctx != nil && s.ctx.handle != nil {
 		if s.segmentCBID != 0 {
 			segmentCallbackMu.Lock()
@@ -177,6 +180,7 @@ func (s *Session) Destroy() {
 			segmentCallbackMu.Unlock()
 			s.segmentCBID = 0
 		}
+		zlog.Info().Msgf("[%s] Destroy: webrtc_hls_session_destroy", s.segmentCBID)
 		C.webrtc_hls_session_destroy(s.ctx.handle, s.handle)
 		s.handle = nil
 	}

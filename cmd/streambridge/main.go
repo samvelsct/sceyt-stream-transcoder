@@ -19,6 +19,7 @@ import (
 	"vt-stream-transcoder/internal/server"
 	"vt-stream-transcoder/internal/webrtchls"
 
+	"github.com/rs/zerolog"
 	zlog "github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -52,18 +53,12 @@ func grpcDurationInterceptor(ctx context.Context, req any, info *grpc.UnaryServe
 		}
 	}
 
-	event := zlog.Info().
-		Str("method", info.FullMethod).
-		Float64("duration_ms", durationMs).
-		Str("code", code.String())
-
+	var sessionID string
 	if r, ok := req.(sessionIDGetter); ok {
-		if sid := r.GetSessionId(); sid != "" {
-			event = event.Str("session_id", sid)
-		}
+		sessionID = r.GetSessionId()
 	}
 
-	event.Msg("grpc request")
+	zlog.Info().Msgf("[%s] GRPC request method: %s | %s | %.3fms", sessionID, info.FullMethod, code.String(), durationMs)
 
 	return resp, err
 }
@@ -154,8 +149,16 @@ func main() {
 	}
 
 	if cfg.Logging.Format == "text" {
+		zerolog.TimeFieldFormat = time.RFC3339Nano
+		// Custom console writer with HH:MM:SS.mmm time format
+		consoleWriter := zerolog.ConsoleWriter{
+			Out:        os.Stderr,
+			TimeFormat: "15:04:05.000", // HH:MM:SS.milliseconds format
+		}
+		zlog.Logger = zlog.With().Caller().Logger().Output(consoleWriter)
 		webrtchls.SetLogFormat(webrtchls.LogFormatText)
 	} else {
+		zerolog.TimeFieldFormat = zerolog.TimeFormatUnixMs
 		webrtchls.SetLogFormat(webrtchls.LogFormatJSON)
 	}
 
@@ -187,7 +190,7 @@ func main() {
 	// Create listener
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.Server.Port))
 	if err != nil {
-		log.Fatalf("Failed to listen on port %d: %v", cfg.Server.Port, err)
+		zlog.Fatal().Msgf("Failed to listen on port %d: %v", cfg.Server.Port, err)
 	}
 
 	// Start LL-HLS HTTP server.
@@ -198,10 +201,10 @@ func main() {
 		defer cancel()
 		hlsSrv.Stop(ctx)
 	}()
-	log.Printf("LL-HLS HTTP server listening on %s", *hlsAddr)
+	zlog.Info().Msgf("LL-HLS HTTP server listening on %s", *hlsAddr)
 
 	// Create StreamBridge server with config
-	log.Println("Creating StreamBridge server...")
+	zlog.Info().Msgf("Creating StreamBridge server...")
 	streamBridgeServer, err := server.NewServer(cfg, hlsSrv)
 	if err != nil {
 		log.Printf("Failed to create server: %v", err)
@@ -209,7 +212,7 @@ func main() {
 		debug.PrintStack()
 		log.Fatalf("Failed to create server: %v", err)
 	}
-	log.Println("StreamBridge server created successfully")
+	zlog.Info().Msgf("StreamBridge server created successfully")
 	defer streamBridgeServer.Close()
 
 	// Create gRPC server with options
@@ -235,21 +238,21 @@ func main() {
 
 	go func() {
 		<-sigChan
-		log.Println("Received shutdown signal, stopping server...")
+		zlog.Info().Msgf("Received shutdown signal, stopping server...")
 		grpcServer.GracefulStop()
 	}()
 
 	startHealthCheck()
 
-	log.Printf("StreamBridge gRPC server starting...")
-	log.Printf("  Port: %d", cfg.Server.Port)
-	log.Printf("  HLS Output: %s", cfg.HLS.OutputDir)
-	log.Printf("  Janus Gateway: %s", cfg.Janus.GatewayAddress)
-	log.Printf("  Log Level: %s", cfg.Logging.Level)
-	log.Printf("  Lib Log Level: %s", cfg.Logging.LibLevel)
-	log.Println("Ready to receive commands for WebRTC to HLS conversion")
+	zlog.Info().Msgf("StreamBridge gRPC server starting...")
+	zlog.Info().Msgf("  Port: %d", cfg.Server.Port)
+	zlog.Info().Msgf("  HLS Output: %s", cfg.HLS.OutputDir)
+	zlog.Info().Msgf("  Janus Gateway: %s", cfg.Janus.GatewayAddress)
+	zlog.Info().Msgf("  Log Level: %s", cfg.Logging.Level)
+	zlog.Info().Msgf("  Lib Log Level: %s", cfg.Logging.LibLevel)
+	zlog.Info().Msgf("Ready to receive commands for WebRTC to HLS conversion")
 
 	if err := grpcServer.Serve(lis); err != nil {
-		log.Fatalf("Failed to serve: %v", err)
+		zlog.Fatal().Msgf("Failed to serve: %v", err)
 	}
 }

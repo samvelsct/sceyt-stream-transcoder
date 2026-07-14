@@ -517,8 +517,8 @@ func New(addr string, cfg *config.HLSConfig) *Server {
 // Start begins serving HTTP in a background goroutine.
 func (s *Server) Start() {
 	go func() {
-		zlog.Info().Str("addr", s.listenOn).Msg("HLS HTTP server listening")
-		if err := s.httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		zlog.Info().Msgf("HLS HTTP server listening: %s", s.listenOn)
+		if err := s.httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			zlog.Error().Err(err).Msg("HLS HTTP server error")
 		}
 	}()
@@ -543,10 +543,10 @@ func (s *Server) RegisterSession(sessionID string, session *webrtchls.Session) e
 			return playlist.GenerateDiskPlaylist(segs, endList)
 		})
 		if err != nil {
-			zlog.Error().Msgf("session %s: disk writer init failed: %v", sessionID, err)
+			zlog.Error().Msgf("[%s] disk writer init failed: %v", sessionID, err)
 		} else {
 			st.SetDiskWriter(dw)
-			zlog.Info().Msgf("session %s: writing LL-HLS to %s", sessionID, outDir)
+			zlog.Info().Msgf("[%s] writing LL-HLS to %s", sessionID, outDir)
 		}
 	}
 	s.mu.Lock()
@@ -558,30 +558,12 @@ func (s *Server) RegisterSession(sessionID string, session *webrtchls.Session) e
 		name = strings.TrimSuffix(name, ".tmp")
 		zlog.Info().Msgf("[%s] %s | %d: segment callback", sessionID, name, len(data))
 		if name == "init.mp4" {
-			zlog.Debug().
-				Str("session", sessionID).
-				Int("bytes", len(data)).
-				Msg("ingest: init.mp4")
-			//data = segmenter.FixVideoEmptyEdit(data)
 			st.SetInit(data)
 		} else if strings.HasSuffix(name, ".m3u8") {
 			// discard library-generated playlist
 		} else if strings.HasSuffix(name, ".m4s") {
 			dur, isKey := segmenter.ParseMoofFromBytes(data, 0)
-			//zlog.Debug().
-			//	Str("session", sessionID).
-			//	Str("file", name).
-			//	Int("bytes", len(data)).
-			//	Float64("parsed_duration_sec", dur).
-			//	Bool("keyframe", isKey).
-			//	Msg("ingest: fragment")
 			st.AddFragment(data, dur, isKey)
-		} else {
-			//zlog.Debug().
-			//	Str("session", sessionID).
-			//	Str("file", name).
-			//	Int("bytes", len(data)).
-			//	Msg("ingest: unknown file (ignored)")
 		}
 	})
 	if err != nil {
@@ -592,12 +574,7 @@ func (s *Server) RegisterSession(sessionID string, session *webrtchls.Session) e
 		return fmt.Errorf("SetSegmentCallback: %w", err)
 	}
 
-	zlog.Info().
-		Str("session", sessionID).
-		Float64("part_duration", s.cfg.PartDuration).
-		Float64("segment_duration", s.cfg.SegmentDuration).
-		Int("playlist_window", s.cfg.PlaylistWindow).
-		Msg("HLS session registered")
+	zlog.Info().Msgf("[%s] HLS session registered: part_duration=%.3f, segment_duration=%.3f, playlist_window=%d", sessionID, s.cfg.PartDuration, s.cfg.SegmentDuration, s.cfg.PlaylistWindow)
 	return nil
 }
 
@@ -616,7 +593,7 @@ func (s *Server) UnregisterSession(sessionID string) {
 	s.mu.Lock()
 	delete(s.stores, sessionID)
 	s.mu.Unlock()
-	zlog.Info().Str("session", sessionID).Msg("HLS session unregistered")
+	zlog.Info().Msgf("[%s] HLS session unregistered", sessionID)
 }
 
 // ---------------------------------------------------------------------------
@@ -685,7 +662,7 @@ func (s *Server) serveFile(w http.ResponseWriter, r *http.Request, state *sessio
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Cache-Control", cacheControl)
 	if _, err := w.Write(data); err != nil {
-		zlog.Debug().Err(err).Str("file", name).Msg("write error")
+		zlog.Debug().Msgf("%s file write error %v", name, err)
 	}
 }
 
@@ -718,22 +695,6 @@ func (s *Server) servePlaylist(w http.ResponseWriter, r *http.Request, st *store
 
 	generatePlaylist := func() {
 		snap := st.Snapshot()
-
-		// Log what live edge is being advertised in this playlist response.
-		// The client will immediately request the PRELOAD-HINT part (cur MSN + next part idx).
-		// If part_ready_age_ms on the subsequent part GET is large, the playlist
-		// took too long to reach the client relative to when the part was produced.
-		//var hintMSN, hintPartIdx int
-		//if snap.CurrentSegment != nil {
-		//	hintMSN = snap.CurrentSegment.MSN
-		//	hintPartIdx = len(snap.CurrentSegment.Parts)
-		//}
-		//zlog.Debug().
-		//	Int("hint_msn", hintMSN).
-		//	Int("hint_part_idx", hintPartIdx).
-		//	Int("completed_segs", len(snap.Segments)).
-		//	Msg("playlist generated")
-
 		var body string
 		if useSkip {
 			body = playlist.GenerateWithSkip(snap, s.cfg.SegmentDuration, s.cfg.PartDuration, st.PartHoldBack)
@@ -769,13 +730,6 @@ func (s *Server) servePlaylist(w http.ResponseWriter, r *http.Request, st *store
 	currentMSN := st.GetCurrentMSN()
 	//currentPartIdx := st.GetCurrentPartIndex()
 	hasIt := st.HasPartOrSegment(targetMSN, targetPart)
-	//zlog.Debug().
-	//	Int("req_msn", targetMSN).
-	//	Int("req_part", targetPart).
-	//	Int("store_current_msn", currentMSN).
-	//	Int("store_current_part_idx", currentPartIdx).
-	//	Bool("available", hasIt).
-	//	Msg("blocking playlist reload")
 
 	// Per spec: if MSN is more than 2 ahead of current, return 400.
 	if targetMSN > currentMSN+2 {
@@ -802,11 +756,7 @@ func (s *Server) servePlaylist(w http.ResponseWriter, r *http.Request, st *store
 	defer cancelWatch()
 
 	if err := st.Notifier().WaitFor(ctx, targetMSN, targetPart); err != nil {
-		zlog.Debug().
-			Int("req_msn", targetMSN).
-			Int("req_part", targetPart).
-			Err(err).
-			Msg("playlist wait failed")
+		zlog.Debug().Msgf("playlist [%d - %d] wait failed %v", targetMSN, targetPart, err)
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			http.Error(w, "timeout waiting for segment", http.StatusServiceUnavailable)
 		}
@@ -858,14 +808,6 @@ func (s *Server) servePart(w http.ResponseWriter, r *http.Request, st *store.Sto
 	//currentMSN := st.GetCurrentMSN()
 	//currentPartIdx := st.GetCurrentPartIndex()
 	hasIt := st.HasPart(msn, partIdx)
-	//zlog.Debug().
-	//	Str("requested_part", name).
-	//	Int("req_msn", msn).
-	//	Int("req_part_idx", partIdx).
-	//	Int("store_current_msn", currentMSN).
-	//	Int("store_current_part_idx", currentPartIdx).
-	//	Bool("part_available", hasIt).
-	//	Msg("player requested part")
 
 	if !hasIt {
 		timeout := time.Duration(s.cfg.SegmentDuration*3) * time.Second
@@ -875,19 +817,9 @@ func (s *Server) servePart(w http.ResponseWriter, r *http.Request, st *store.Sto
 		cancelWatch := st.Notifier().OnContextCancel(ctx)
 		defer cancelWatch()
 
-		//zlog.Debug().
-		//	Int("req_msn", msn).
-		//	Int("req_part_idx", partIdx).
-		//	Dur("timeout", timeout).
-		//	Msg("blocking wait for part")
-
 		if err := st.Notifier().WaitFor(ctx, msn, partIdx); err != nil {
-			zlog.Debug().
-				Int("req_msn", msn).
-				Int("req_part_idx", partIdx).
-				Err(err).
-				Msg("wait for part failed")
-			if ctx.Err() == context.DeadlineExceeded {
+			zlog.Debug().Msgf("wait for part [%d - %d] failed %v", msn, partIdx, err)
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				http.Error(w, "timeout waiting for part", http.StatusServiceUnavailable)
 			}
 			return
@@ -896,18 +828,10 @@ func (s *Server) servePart(w http.ResponseWriter, r *http.Request, st *store.Sto
 
 	part := st.GetPart(msn, partIdx)
 	if part == nil {
-		zlog.Warn().
-			Int("req_msn", msn).
-			Int("req_part_idx", partIdx).
-			Msg("part still nil after wait — returning 404")
+		zlog.Warn().Msgf("part [%d - %d] still nil after wait — returning 404", msn, partIdx)
 		http.NotFound(w, r)
 		return
 	}
-	//zlog.Debug().
-	//	Int("msn", msn).
-	//	Int("part_idx", partIdx).
-	//	Int("bytes", len(part.Data)).
-	//	Msg("serving part")
 	w.Header().Set("Content-Type", "video/mp4")
 	w.Header().Set("Cache-Control", "no-cache")
 	if _, err := w.Write(part.Data); err != nil {
@@ -941,20 +865,12 @@ func (s *Server) servePartFromDisk(w http.ResponseWriter, r *http.Request, st *s
 
 	data, err := dw.ReadPart(msn, partIdx)
 	if err != nil {
-		zlog.Debug().
-			Int("msn", msn).
-			Int("part_idx", partIdx).
-			Err(err).
-			Msg("part not found on disk")
+		zlog.Debug().Msgf("part [%d - %d] not found on disk %v", msn, partIdx, err)
 		http.NotFound(w, r)
 		return
 	}
 
-	zlog.Debug().
-		Int("msn", msn).
-		Int("part_idx", partIdx).
-		Int("bytes", len(data)).
-		Msg("serving part from disk (explicit)")
+	zlog.Debug().Msgf("serving part [%d - %d] bytes=%d from disk (explicit)", msn, partIdx, len(data))
 	w.Header().Set("Content-Type", "video/mp4")
 	w.Header().Set("Cache-Control", "no-cache")
 	if _, err := w.Write(data); err != nil {
@@ -981,7 +897,7 @@ func (s *Server) serveMedia(w http.ResponseWriter, r *http.Request, state *sessi
 	w.Header().Set("Content-Type", "video/mp4")
 	w.Header().Set("Cache-Control", "no-cache")
 	if _, err := w.Write(data); err != nil {
-		zlog.Debug().Err(err).Str("file", name).Msg("media write error")
+		zlog.Debug().Msgf("media file %s write error %v", name, err)
 	}
 }
 
