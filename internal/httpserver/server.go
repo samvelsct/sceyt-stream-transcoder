@@ -578,22 +578,42 @@ func (s *Server) RegisterSession(sessionID string, session *webrtchls.Session) e
 	return nil
 }
 
-// UnregisterSession finalizes and removes a session's state.
-// Finalize is called before the store is removed so that any clients blocked
-// on a blocking playlist reload receive a final playlist with #EXT-X-ENDLIST.
+// unregisterGracePeriod is how long a finalized session's store stays
+// reachable in s.stores after UnregisterSession. Players typically keep
+// polling the playlist for a bit after the last segment; keeping the store
+// around lets that request still resolve and receive the final playlist
+// with #EXT-X-ENDLIST instead of a bare 404 "session not found".
+var unregisterGracePeriod = 10 * time.Second
+
+// UnregisterSession finalizes a session's store and, after a grace period,
+// removes it. Finalize is called immediately so that any clients blocked on
+// a blocking playlist reload receive a final playlist with #EXT-X-ENDLIST;
+// the store itself is kept around a little longer so that new (non-blocking)
+// playlist requests arriving after destruction still get the ENDLIST
+// playlist rather than a 404.
 func (s *Server) UnregisterSession(sessionID string) {
 	s.mu.RLock()
 	st := s.stores[sessionID]
 	s.mu.RUnlock()
 
-	if st != nil {
-		st.Finalize()
+	if st == nil {
+		return
 	}
 
-	s.mu.Lock()
-	delete(s.stores, sessionID)
-	s.mu.Unlock()
-	zlog.Info().Msgf("[%s] HLS session unregistered", sessionID)
+	st.Finalize()
+
+	zlog.Info().Msgf("[%s] HLS session start delete timer", sessionID)
+	time.AfterFunc(unregisterGracePeriod, func() {
+		s.mu.Lock()
+		// Only delete if this is still the same store — a new session may
+		// have re-registered under the same sessionID in the meantime.
+		if s.stores[sessionID] == st {
+			delete(s.stores, sessionID)
+			zlog.Info().Msgf("[%s] HLS session deleted from store", sessionID)
+		}
+		s.mu.Unlock()
+	})
+	zlog.Info().Msgf("[%s] HLS session unregistered (store retained for %s to serve final playlist)", sessionID, unregisterGracePeriod)
 }
 
 // ---------------------------------------------------------------------------

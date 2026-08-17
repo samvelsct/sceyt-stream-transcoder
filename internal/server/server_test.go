@@ -24,7 +24,7 @@ func newTestServer(t *testing.T) *Server {
 		},
 	}
 
-	server, err := NewServer(cfg)
+	server, err := NewServer(cfg, nil)
 	if err != nil {
 		t.Fatalf("Failed to create server: %v", err)
 	}
