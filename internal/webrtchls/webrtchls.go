@@ -196,6 +196,8 @@ type InputConfig struct {
 	JanusAdminKey       string // Janus admin API key (default: "adminpwd")
 	JanusAdminSecret    string // Janus admin secret (default: "admin")
 	DisplayName         string // Human-readable display name for the participant
+	Muted               bool   // Initial mute state for the participant
+	VideoOn             bool   // Initial video state for the participant
 }
 
 // AddInput adds a WebRTC input to the session.
@@ -217,6 +219,15 @@ func (s *Session) AddInput(config *InputConfig) error {
 	cDisplayName := C.CString(config.DisplayName)
 	defer C.free(unsafe.Pointer(cDisplayName))
 
+	cMuted := C.int(0)
+	if config.Muted {
+		cMuted = 1
+	}
+	cVideoOn := C.int(0)
+	if config.VideoOn {
+		cVideoOn = 1
+	}
+
 	cConfig := C.webrtc_hls_input_config_t{
 		janus_room_id:         C.uint64_t(config.JanusRoomID),
 		janus_session_id:      C.uint64_t(config.JanusSessionID),
@@ -226,6 +237,8 @@ func (s *Session) AddInput(config *InputConfig) error {
 		janus_admin_key:       cAdminKey,
 		janus_admin_secret:    cAdminSecret,
 		display_name:          cDisplayName,
+		muted:                 cMuted,
+		video_on:              cVideoOn,
 	}
 
 	result := C.webrtc_hls_add_input(s.ctx.handle, s.handle, &cConfig)

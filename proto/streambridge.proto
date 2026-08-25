@@ -64,6 +64,8 @@ message AddInputRequest {
   string janus_admin_key = 7;         // Janus admin API key
   string janus_admin_secret = 8;      // Janus admin secret
   string display_name = 9;            // Participant display name
+  bool muted = 10;                    // Initial mute state for the participant (default: false)
+  bool video_on = 11;                 // Initial video state for the participant (default: false)
 }
 
 message AddInputResponse {

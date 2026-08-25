@@ -252,6 +252,8 @@ typedef struct {
     const char *janus_admin_key; /**< Janus admin API key (default: "adminpwd") */
     const char *janus_admin_secret; /**< Janus admin secret (default: "admin") */
     const char *display_name; /**< Human-readable display name for the participant */
+    int muted; /**< Initial mute state for the participant: 0=unmuted, 1=muted */
+    int video_on; /**< Initial video state for the participant: 1=on, 0=off */
 } webrtc_hls_input_config_t;
 
 /**
@@ -273,6 +275,10 @@ typedef struct {
  * @note Multiple inputs can be added to the same session
  * @note The library will automatically establish WebRTC peer connection
  * @note Janus gateway must be running and accessible
+ * @note config->muted/config->video_on seed the participant's initial state (e.g. a
+ *       co-host that joins already muted); the "add-input" tag and subsequent
+ *       participants snapshots reflect these values immediately, so viewers who
+ *       join after the fact still see the correct state
  * @see webrtc_hls_remove_input()
  */
 WEBRTC_HLS_API int webrtc_hls_add_input(

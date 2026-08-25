@@ -291,6 +291,8 @@ func (s *Server) AddInput(_ context.Context, req *pb.AddInputRequest) (*pb.AddIn
 		JanusAdminKey:       janusAdminKey,
 		JanusAdminSecret:    janusAdminSecret,
 		DisplayName:         req.DisplayName,
+		Muted:               req.Muted,
+		VideoOn:             req.VideoOn,
 	}
 
 	zlog.Info().Msgf("[%s] Calling session.AddInput with config %v", req.SessionId, req)
