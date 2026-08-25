@@ -36,6 +36,16 @@ message CreateSessionRequest {
   string session_id = 1;   // Unique identifier for the session
   string output_path = 2;  // Output path for HLS manifest (e.g., "/path/to/output.m3u8")
   bool enable_gst = 3;     // Use GStreamer backend (false=FFmpeg, true=GStreamer)
+  HlsProperties hls_properties = 4;
+}
+
+message HlsProperties {
+  // HLS output properties
+  uint32 hls_time = 4;           // Target segment duration in seconds (default: 6)
+  uint32 hls_list_size = 5;      // Maximum number of playlist entries (default: 5, 0=unlimited)
+  string hls_flags = 6;          // HLS muxer flags (e.g., "delete_segments+append_list")
+  uint32 hls_segment_type = 7;   // Segment container format (0=mpegts, 1=fmp4)
+  string hls_segment_filename = 8; // Pattern for segment filenames (e.g., "segment_%03d.ts")
 }
 
 message CreateSessionResponse {
