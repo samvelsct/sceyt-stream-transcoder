@@ -18,6 +18,17 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// SessionRegistry is the seam through which CreateSession publishes an
+// Ownership Registry record (Epic C2) and DestroySession marks it
+// FINALIZING, ahead of httpserver's grace-period delete. Defined here (not
+// imported from internal/registry) so this package has no Redis dependency
+// when the registry is disabled — a *registry.Registry satisfies this
+// interface structurally.
+type SessionRegistry interface {
+	Register(ctx context.Context, sessionID, workerID, origin string) (generation int64, err error)
+	Finalize(ctx context.Context, sessionID string, generation int64) error
+}
+
 // Server implements the StreamBridge gRPC service
 type Server struct {
 	pb.UnimplementedStreamBridgeServer
@@ -27,6 +38,26 @@ type Server struct {
 	hlsSrv   *httpserver.Server // LL-HLS HTTP server (may be nil)
 	mu       sync.RWMutex
 	memStats map[string]runtime.MemStats // Per-session memory tracking
+
+	registry    SessionRegistry  // nil unless the registry is enabled
+	workerID    string           // this instance's identity in ownership records (Epic A2)
+	originAddr  string           // this instance's HTTP address, published in ownership records
+	generations map[string]int64 // sessionID -> Ownership Registry generation
+}
+
+// SetSessionRegistry wires session lifecycle events to the Ownership
+// Registry (Epic C). workerID must match the identity Fleet Controller's
+// streambridge LifecycleController.List() discovers this instance as;
+// originAddr is this instance's HTTP address for the Origin Router to proxy
+// to. Call before serving traffic; a nil registry (the default) leaves
+// CreateSession/DestroySession behaving exactly as before the registry
+// existed.
+func (s *Server) SetSessionRegistry(reg SessionRegistry, workerID, originAddr string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.registry = reg
+	s.workerID = workerID
+	s.originAddr = originAddr
 }
 
 // NewServer creates a new StreamBridge server.
@@ -67,15 +98,31 @@ func NewServer(cfg *config.Config, hlsSrv *httpserver.Server) (serverPtr *Server
 
 	zlog.Info().Msg("Creating Server struct...")
 	server := &Server{
-		ctx:      ctx,
-		sessions: make(map[string]*webrtchls.Session),
-		config:   cfg,
-		hlsSrv:   hlsSrv,
-		memStats: make(map[string]runtime.MemStats),
+		ctx:         ctx,
+		sessions:    make(map[string]*webrtchls.Session),
+		config:      cfg,
+		hlsSrv:      hlsSrv,
+		memStats:    make(map[string]runtime.MemStats),
+		generations: make(map[string]int64),
 	}
 	zlog.Info().Msg("Server struct created successfully")
 
 	return server, nil
+}
+
+// ActiveSessionCount returns the number of sessions currently held in
+// memory. Exposed for the /metrics endpoint (Epic A) that Fleet Controller's
+// streambridge collector scrapes to make placement decisions.
+func (s *Server) ActiveSessionCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.sessions)
+}
+
+// MaxConcurrentStreams returns the configured session capacity for this
+// instance, also exposed via /metrics.
+func (s *Server) MaxConcurrentStreams() uint32 {
+	return s.config.Server.MaxConcurrentStreams
 }
 
 // Close cleans up the server resources
@@ -104,7 +151,7 @@ func (s *Server) Close() {
 }
 
 // CreateSession creates a new HLS output session
-func (s *Server) CreateSession(_ context.Context, req *pb.CreateSessionRequest) (*pb.CreateSessionResponse, error) {
+func (s *Server) CreateSession(ctx context.Context, req *pb.CreateSessionRequest) (*pb.CreateSessionResponse, error) {
 	zlog.Info().Msgf("[%s] CreateSessionRequest: %v", req.SessionId, req)
 	if req.SessionId == "" {
 		return &pb.CreateSessionResponse{
@@ -180,6 +227,23 @@ func (s *Server) CreateSession(_ context.Context, req *pb.CreateSessionRequest) 
 		zlog.Info().Msgf("[%s] CreateSession: hlsSrv.RegisterSession returned", req.SessionId)
 	}
 
+	// Publish the Ownership Registry record (Epic C2) so the Origin Router
+	// can find this instance for viewer LL-HLS requests. Best-effort: a
+	// registry failure here doesn't fail session creation — it just means
+	// the Origin Router can't route to this session until the registry
+	// recovers, which is no worse than the pre-registry world.
+	if s.registry != nil {
+		gen, regErr := s.registry.Register(ctx, req.SessionId, s.workerID, s.originAddr)
+		if regErr != nil {
+			zlog.Warn().Err(regErr).Msgf("[%s] Failed to publish ownership registry record", req.SessionId)
+		} else {
+			s.generations[req.SessionId] = gen
+			if s.hlsSrv != nil {
+				s.hlsSrv.SetGeneration(req.SessionId, gen)
+			}
+		}
+	}
+
 	// Capture memory stats after session creation (STW pause under lock)
 	zlog.Info().Msgf("[%s] CreateSession: calling runtime.ReadMemStats (STW, under lock)", req.SessionId)
 	var memStats runtime.MemStats
@@ -194,7 +258,7 @@ func (s *Server) CreateSession(_ context.Context, req *pb.CreateSessionRequest) 
 }
 
 // DestroySession destroys an existing session
-func (s *Server) DestroySession(_ context.Context, req *pb.DestroySessionRequest) (*pb.DestroySessionResponse, error) {
+func (s *Server) DestroySession(ctx context.Context, req *pb.DestroySessionRequest) (*pb.DestroySessionResponse, error) {
 	zlog.Info().Msgf("[%s] DestroySession: %v", req.SessionId, req)
 
 	zlog.Info().Msgf("[%s][MUTEX] DestroySession: write lock", req.SessionId)
@@ -215,6 +279,18 @@ func (s *Server) DestroySession(_ context.Context, req *pb.DestroySessionRequest
 	zlog.Info().Msgf("[%s] DestroySession: session.Destroy", req.SessionId)
 	session.Destroy()
 	delete(s.sessions, req.SessionId)
+
+	// Mark the ownership record FINALIZING (Epic C2) — the actual delete
+	// happens on httpserver's existing grace-period timer, alongside the
+	// in-memory HLS store eviction, via SetGeneration/SetRegistryDeleter.
+	if s.registry != nil {
+		if gen, ok := s.generations[req.SessionId]; ok {
+			if finErr := s.registry.Finalize(ctx, req.SessionId, gen); finErr != nil {
+				zlog.Warn().Err(finErr).Msgf("[%s] Failed to finalize ownership registry record", req.SessionId)
+			}
+		}
+		delete(s.generations, req.SessionId)
+	}
 
 	// Unregister from the LL-HLS HTTP server.
 	if s.hlsSrv != nil {

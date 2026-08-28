@@ -1,0 +1,95 @@
+# StreamBridge Origin pods. Kubernetes owns creation/destruction/placement
+# of these pods entirely — Fleet Controller only discovers and monitors
+# them (lifecycle.mode: static in its streambridge fleet config; see
+# vt-fleet-controller's configs/local.yaml). A plain Deployment, not a
+# StatefulSet: a session is session-affine in-memory state, but that state
+# is lost on pod restart regardless of whether the replacement has the same
+# name, so a StatefulSet's stable identity buys nothing here (see
+# docs/horizontal-scaling.md).
+#
+# Open risk, unresolved: whether webrtchls's ICE/DTLS negotiation with Janus
+# survives ordinary Kubernetes pod networking, or needs hostNetwork like
+# LiveKit's WebRTC SFU does for the same class of reason. Verify against the
+# target cluster before trusting this manifest as final — see
+# docs/horizontal-scaling.md's "Open risks" section.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: streambridge
+  labels:
+    app: streambridge
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: streambridge
+  template:
+    metadata:
+      labels:
+        app: streambridge
+    spec:
+      containers:
+        - name: streambridge
+          image: streambridge:latest
+          args: ["-hls-addr=:8080"]
+          ports:
+            - name: grpc
+              containerPort: 50051
+            - name: http
+              containerPort: 8080
+          env:
+            # Downward API — composed into REGISTRY_ORIGIN_ADDR at startup
+            # (cmd/streambridge/main.go's resolveOriginAddr), not string-
+            # interpolated by Kubernetes.
+            - name: POD_IP
+              valueFrom: { fieldRef: { fieldPath: status.podIP } }
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+
+            - name: REGISTRY_ENABLED
+              value: "true"
+            - name: REGISTRY_REDIS_ADDR
+              value: "streambridge-registry-redis:6379"
+            # REGISTRY_WORKER_ID / REGISTRY_ORIGIN_ADDR intentionally unset —
+            # resolved at startup from POD_NAME / POD_IP + the HLS port.
+
+          readinessProbe:
+            httpGet: { path: /healthcheck, port: 8080 }
+            initialDelaySeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthcheck, port: 8080 }
+            initialDelaySeconds: 10
+
+          resources:
+            # Sizing per resource class (Small/Medium/Large/GPU), not a
+            # single fixed number for every session shape — see
+            # docs/horizontal-scaling.md's resource-model section. These are
+            # placeholder "Medium" values; benchmark before trusting them.
+            requests:
+              cpu: "4"
+              memory: "2Gi"
+            limits:
+              cpu: "6"
+              memory: "3Gi"
+---
+# This Service exists ONLY so Fleet Controller's streambridge
+# LifecycleController.List() can discover pod endpoints via EndpointSlice —
+# it is how Fleet Controller learns which instances exist at all in static
+# mode. Signaling must NEVER call CreateSession/AddInput through this
+# Service's ClusterIP: that would round-robin across pods and break session
+# affinity outright. Signaling always dials the specific pod address
+# Fleet Controller's SelectHost returned, directly.
+apiVersion: v1
+kind: Service
+metadata:
+  name: streambridge
+spec:
+  selector:
+    app: streambridge
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+    - name: http
+      port: 8080
+      targetPort: 8080

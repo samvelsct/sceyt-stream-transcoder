@@ -59,6 +59,60 @@ hls:
 
   write_on_disk: true
 
+# Ownership Registry Configuration (horizontal scaling, Epic C)
+# Disabled by default — a standalone instance behaves exactly as before.
+# See docs/horizontal-scaling.md for the full design.
+registry:
+  enabled: true
+
+  # Redis connection for the session Ownership Registry. Matches the Redis
+  # instance the nginx Lua Origin Router (streambridge-lua-redis.conf) reads
+  # from -- both must point at the same Redis for the "streambridge:session:*"
+  # lookup to ever find anything.
+  redis_addr: "192.168.178.102:6379"
+  redis_password: ""
+  redis_db: 0
+
+  # Key prefix for all registry keys in Redis.
+  key_prefix: "streambridge:"
+
+  # This instance's identity in ownership records. Must match whatever
+  # Fleet Controller's streambridge LifecycleController.List() discovers
+  # this instance as. Leave empty to fall back to $POD_NAME then hostname.
+  worker_id: ""
+
+  # This instance's HTTP address, published in ownership records for the
+  # Origin Router to proxy to. Leave empty in Kubernetes to compose it from
+  # $POD_IP (Downward API) + the HLS listen port automatically; set
+  # explicitly for docker-compose/local testing where there's no pod IP.
+  origin_addr: ""
+
+  # Coarse safety-net TTL on ownership records — a backstop against a
+  # permanent leak if a crashed instance's record is never cleared. Not the
+  # primary cleanup path (that's still the existing grace-period unregister
+  # flow), so this can safely be long.
+  session_ttl: 24h
+
+# Origin Router Configuration (horizontal scaling, Epic D)
+# Only used by the separate streambridge-origin-router binary.
+origin_router:
+  # Address for the Origin Router's own HTTP server.
+  listen_addr: ":8090"
+
+  # How long a resolved sessionID -> owner lookup is cached locally before
+  # being re-read from the registry.
+  ownership_cache_ttl: 2s
+
+  # Fleet Controller integration for the liveness cross-check (Epic D4):
+  # before proxying, confirm the owning instance is still known-healthy.
+  # Disabled by default — the Origin Router works without it, just without
+  # that cross-check (a crashed origin's sessions surface as proxy errors
+  # instead of clean 404s until the registry's safety-net TTL expires them).
+  fleet_controller:
+    enabled: false
+    grpc_addr: "fleet-controller:9090"
+    service_name: "streambridge"
+
 # Logging Configuration
 logging:
   # Application log level: debug, info, warn, error (default: info)

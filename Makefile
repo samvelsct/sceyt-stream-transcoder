@@ -12,6 +12,20 @@ proto:
 		--proto_path=proto \
 		streambridge.proto
 
+# Regenerate the local client stub for Fleet Controller's FleetStatusService.
+# proto/fleetcontroller.proto is a copy of vt-fleet-controller's
+# api/proto/fleetcontroller/v1/fleet_status.proto with go_package rewritten —
+# Fleet Controller's generated code lives under its own internal/ package and
+# can't be imported cross-module, so we generate our own client from the same
+# wire contract instead. Re-copy+run this if the upstream .proto changes.
+fleetproto:
+	@echo "Generating Fleet Controller client stub..."
+	@mkdir -p api/fleetpb
+	protoc --go_out=api/fleetpb --go_opt=paths=source_relative \
+		--go-grpc_out=api/fleetpb --go-grpc_opt=paths=source_relative \
+		--proto_path=proto \
+		fleetcontroller.proto
+
 # Build the server
 build: proto
 	@echo "Building streambridge server..."

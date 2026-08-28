@@ -430,6 +430,25 @@ func (ss *sessionState) listFiles() []string {
 //	GET /streams/{sessionID}/stream.m3u8     – LL-HLS playlist (blocking reload)
 //	GET /streams/{sessionID}/seg_NNNNN.m4s   – full segment (virtual, assembled from parts)
 //	GET /streams/{sessionID}/part_NNNNN.m4s  – partial segment
+//
+// SessionCounter exposes StreamBridge's live session load for /metrics
+// (Epic A) — Fleet Controller's streambridge collector scrapes this to make
+// placement decisions, the same way it scrapes Janus's handle/session
+// counts today.
+type SessionCounter interface {
+	ActiveSessionCount() int
+	MaxConcurrentStreams() uint32
+}
+
+// SessionRegistryDeleter is the seam through which UnregisterSession clears
+// a session's Ownership Registry record (Epic C) once its grace period
+// elapses. Defined here (not imported from internal/registry) so this
+// package has no Redis dependency when the registry is disabled — a
+// *registry.Registry satisfies this interface structurally.
+type SessionRegistryDeleter interface {
+	Delete(ctx context.Context, sessionID string, generation int64) error
+}
+
 type Server struct {
 	cfg *config.HLSConfig
 	mu  sync.RWMutex
@@ -438,6 +457,42 @@ type Server struct {
 	mux      *http.ServeMux
 	httpSrv  *http.Server
 	listenOn string
+
+	sessionCounter  SessionCounter         // nil unless SetSessionCounter is called
+	registryDeleter SessionRegistryDeleter // nil unless the registry is enabled
+	generations     map[string]int64       // sessionID -> Ownership Registry generation, set alongside stores
+}
+
+// SetSessionCounter wires the /metrics endpoint to the gRPC server's live
+// session count. Called once from cmd/streambridge/main.go.
+func (s *Server) SetSessionCounter(sc SessionCounter) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessionCounter = sc
+}
+
+// SetRegistryDeleter wires UnregisterSession's existing grace-period timer
+// to also clear the session's Ownership Registry record (Epic C). A nil
+// deleter (the default) leaves behavior exactly as it was before the
+// registry existed.
+func (s *Server) SetRegistryDeleter(d SessionRegistryDeleter) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.registryDeleter = d
+}
+
+// SetGeneration records which Ownership Registry generation a session was
+// registered under, so UnregisterSession's grace-period cleanup can pass it
+// back to SessionRegistryDeleter.Delete for fencing. Called by
+// internal/server.Server right after a successful registry.Register, right
+// alongside its existing call to RegisterSession.
+func (s *Server) SetGeneration(sessionID string, generation int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.generations == nil {
+		s.generations = make(map[string]int64)
+	}
+	s.generations[sessionID] = generation
 }
 
 type statusRecorder struct {
@@ -473,6 +528,7 @@ func New(addr string, cfg *config.HLSConfig) *Server {
 	s.mux.HandleFunc("/healthcheck", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
+	s.mux.HandleFunc("/metrics", s.metricsHandler)
 	s.mux.HandleFunc("/live/", s.indexHandler)
 
 	s.httpSrv = &http.Server{
@@ -594,6 +650,8 @@ var unregisterGracePeriod = 10 * time.Second
 func (s *Server) UnregisterSession(sessionID string) {
 	s.mu.RLock()
 	st := s.stores[sessionID]
+	gen, hasGen := s.generations[sessionID]
+	deleter := s.registryDeleter
 	s.mu.RUnlock()
 
 	if st == nil {
@@ -609,11 +667,55 @@ func (s *Server) UnregisterSession(sessionID string) {
 		// have re-registered under the same sessionID in the meantime.
 		if s.stores[sessionID] == st {
 			delete(s.stores, sessionID)
+			delete(s.generations, sessionID)
 			zlog.Info().Msgf("[%s] HLS session deleted from store", sessionID)
 		}
 		s.mu.Unlock()
+
+		// Clear the Ownership Registry record (Epic C), fenced on the
+		// generation this session was registered under — a stale deleter
+		// call (e.g. this same timer racing a newer registration) is
+		// rejected by the registry rather than deleting a newer owner's
+		// record. Best-effort: a Redis outage here just leaves the coarse
+		// safety-net TTL to expire the record eventually.
+		if deleter != nil && hasGen {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if err := deleter.Delete(ctx, sessionID, gen); err != nil {
+				zlog.Warn().Err(err).Msgf("[%s] failed to clear ownership registry record", sessionID)
+			}
+		}
 	})
 	zlog.Info().Msgf("[%s] HLS session unregistered (store retained for %s to serve final playlist)", sessionID, unregisterGracePeriod)
+}
+
+// metricsHandler exposes a small, hand-written Prometheus exposition (Epic
+// A) — deliberately not pulling in the full client_golang dependency for
+// three gauges. Fleet Controller's streambridge collector scrapes this on
+// whatever interval its metrics.pollingInterval config sets (see
+// docs/horizontal-scaling.md for the exact contract).
+func (s *Server) metricsHandler(w http.ResponseWriter, _ *http.Request) {
+	s.mu.RLock()
+	sc := s.sessionCounter
+	s.mu.RUnlock()
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+
+	fmt.Fprintln(w, "# HELP streambridge_up Whether this instance is reachable (always 1 if scraped successfully).")
+	fmt.Fprintln(w, "# TYPE streambridge_up gauge")
+	fmt.Fprintln(w, "streambridge_up 1")
+
+	if sc == nil {
+		return
+	}
+
+	fmt.Fprintln(w, "# HELP streambridge_active_sessions Number of sessions currently held in memory on this instance.")
+	fmt.Fprintln(w, "# TYPE streambridge_active_sessions gauge")
+	fmt.Fprintf(w, "streambridge_active_sessions %d\n", sc.ActiveSessionCount())
+
+	fmt.Fprintln(w, "# HELP streambridge_max_concurrent_streams Configured session capacity for this instance.")
+	fmt.Fprintln(w, "# TYPE streambridge_max_concurrent_streams gauge")
+	fmt.Fprintf(w, "streambridge_max_concurrent_streams %d\n", sc.MaxConcurrentStreams())
 }
 
 // ---------------------------------------------------------------------------

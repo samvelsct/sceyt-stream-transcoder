@@ -16,9 +16,11 @@ import (
 	pb "vt-stream-transcoder/api"
 	"vt-stream-transcoder/internal/config"
 	"vt-stream-transcoder/internal/httpserver"
+	"vt-stream-transcoder/internal/registry"
 	"vt-stream-transcoder/internal/server"
 	"vt-stream-transcoder/internal/webrtchls"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 	zlog "github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
@@ -27,6 +29,43 @@ import (
 	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
 )
+
+// resolveWorkerID determines this instance's identity in Ownership Registry
+// records (Epic A2) — must match whatever Fleet Controller's streambridge
+// LifecycleController.List() discovers this instance as.
+func resolveWorkerID(cfg *config.Config) string {
+	if cfg.Registry.WorkerID != "" {
+		return cfg.Registry.WorkerID
+	}
+	if name := os.Getenv("POD_NAME"); name != "" {
+		return name
+	}
+	if h, err := os.Hostname(); err == nil {
+		return h
+	}
+	return "unknown"
+}
+
+// resolveOriginAddr determines this instance's HTTP address, published in
+// ownership records for the Origin Router to proxy to. Prefers an explicit
+// override (needed for docker-compose/tests where there's no pod IP);
+// otherwise composes host:port from the Kubernetes Downward API's POD_IP
+// plus the configured HLS listen port — deliberately not left to Kubernetes
+// to string-interpolate.
+func resolveOriginAddr(cfg *config.Config, hlsAddr string) string {
+	if cfg.Registry.OriginAddr != "" {
+		return cfg.Registry.OriginAddr
+	}
+	podIP := os.Getenv("POD_IP")
+	if podIP == "" {
+		return ""
+	}
+	_, port, err := net.SplitHostPort(hlsAddr)
+	if err != nil || port == "" {
+		port = "8080"
+	}
+	return net.JoinHostPort(podIP, port)
+}
 
 var (
 	configFile = flag.String("config", "", "Path to configuration file (YAML)")
@@ -172,7 +211,7 @@ func main() {
 		fmt.Printf("\n  Janus Gateway: %s\n", cfg.Janus.GatewayAddress)
 		fmt.Printf("  Janus Admin Key: %s\n", cfg.Janus.AdminKey)
 		fmt.Printf("\n  HLS Output Dir: %s\n", cfg.HLS.OutputDir)
-		fmt.Printf("  HLS Segment Duration: %d seconds\n", cfg.HLS.SegmentDuration)
+		fmt.Printf("  HLS Segment Duration: %g seconds\n", cfg.HLS.SegmentDuration)
 		fmt.Printf("  HLS Playlist Window: %d segments\n", cfg.HLS.PlaylistWindow)
 		fmt.Printf("  Enable GStreamer: %v\n", cfg.HLS.EnableGStreamer)
 		fmt.Printf("\n  Log Level: %s\n", cfg.Logging.Level)
@@ -214,6 +253,32 @@ func main() {
 	}
 	zlog.Info().Msgf("StreamBridge server created successfully")
 	defer streamBridgeServer.Close()
+
+	// Always expose live session load via /metrics (Epic A) — useful to
+	// Fleet Controller's streambridge collector regardless of whether our
+	// own Ownership Registry (Epic C) below is enabled.
+	hlsSrv.SetSessionCounter(streamBridgeServer)
+
+	if cfg.Registry.Enabled {
+		workerID := resolveWorkerID(cfg)
+		originAddr := resolveOriginAddr(cfg, *hlsAddr)
+		if originAddr == "" {
+			zlog.Fatal().Msg("registry.enabled is true but no origin address could be resolved " +
+				"(set POD_IP, or registry.origin_addr / REGISTRY_ORIGIN_ADDR explicitly)")
+		}
+		rdb := redis.NewClient(&redis.Options{
+			Addr:     cfg.Registry.RedisAddr,
+			Password: cfg.Registry.RedisPassword,
+			DB:       cfg.Registry.RedisDB,
+		})
+		defer rdb.Close()
+
+		reg := registry.New(rdb, cfg.Registry.KeyPrefix, cfg.Registry.SessionTTL)
+		hlsSrv.SetRegistryDeleter(reg)
+		streamBridgeServer.SetSessionRegistry(reg, workerID, originAddr)
+		zlog.Info().Msgf("Ownership registry enabled: worker_id=%s origin=%s redis=%s",
+			workerID, originAddr, cfg.Registry.RedisAddr)
+	}
 
 	// Create gRPC server with options
 	grpcOpts := []grpc.ServerOption{

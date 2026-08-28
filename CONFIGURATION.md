@@ -183,6 +183,43 @@ export LOG_FORMAT="json"
 export LOG_OUTPUT="/var/log/streambridge.log"
 ```
 
+### Ownership Registry Configuration (horizontal scaling)
+
+Disabled by default — a standalone instance behaves exactly as before this existed. See
+`docs/horizontal-scaling.md` for the full design (Ownership Registry + Origin Router, and how they relate to
+Fleet Controller's separate role in placing *new* sessions).
+
+| Option | Config File | Environment Variable | Default | Description |
+|--------|-------------|---------------------|---------|-------------|
+| Enabled | `registry.enabled` | `REGISTRY_ENABLED` | false | Opt-in; false leaves behavior unchanged |
+| Redis address | `registry.redis_addr` | `REGISTRY_REDIS_ADDR` | localhost:6379 | |
+| Redis password | `registry.redis_password` | `REGISTRY_REDIS_PASSWORD` | (empty) | |
+| Redis DB | `registry.redis_db` | `REGISTRY_REDIS_DB` | 0 | |
+| Key prefix | `registry.key_prefix` | `REGISTRY_KEY_PREFIX` | streambridge: | |
+| Worker ID | `registry.worker_id` | `REGISTRY_WORKER_ID` | $POD_NAME, else hostname | Must match Fleet Controller's discovered instance ID |
+| Origin address | `registry.origin_addr` | `REGISTRY_ORIGIN_ADDR` | $POD_IP + HLS port | Set explicitly outside Kubernetes |
+| Session TTL | `registry.session_ttl` | `REGISTRY_SESSION_TTL` | 24h | Coarse safety-net only, not the primary cleanup path |
+
+**Example (Environment, Kubernetes):**
+```bash
+export REGISTRY_ENABLED=true
+export REGISTRY_REDIS_ADDR=redis:6379
+# REGISTRY_WORKER_ID and REGISTRY_ORIGIN_ADDR left unset — composed from
+# $POD_NAME / $POD_IP (Downward API) automatically.
+```
+
+### Origin Router Configuration (horizontal scaling)
+
+Only used by the separate `streambridge-origin-router` binary.
+
+| Option | Config File | Environment Variable | Default | Description |
+|--------|-------------|---------------------|---------|-------------|
+| Listen address | `origin_router.listen_addr` | `ORIGIN_ROUTER_LISTEN_ADDR` | :8090 | |
+| Ownership cache TTL | `origin_router.ownership_cache_ttl` | `ORIGIN_ROUTER_OWNERSHIP_CACHE_TTL` | 2s | |
+| Fleet Controller enabled | `origin_router.fleet_controller.enabled` | `FLEET_CONTROLLER_ENABLED` | false | Liveness cross-check (Epic D4); works without it, just without that check |
+| Fleet Controller gRPC address | `origin_router.fleet_controller.grpc_addr` | `FLEET_CONTROLLER_GRPC_ADDR` | (empty) | |
+| Fleet Controller service name | `origin_router.fleet_controller.service_name` | `FLEET_CONTROLLER_SERVICE_NAME` | streambridge | Must match the fleet name Fleet Controller registers StreamBridge under |
+
 ## Command-Line Flags
 
 Available flags:

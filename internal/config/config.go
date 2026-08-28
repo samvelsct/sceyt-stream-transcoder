@@ -11,10 +11,57 @@ import (
 
 // Config holds the application configuration
 type Config struct {
-	Server  ServerConfig  `yaml:"server"`
-	Janus   JanusConfig   `yaml:"janus"`
-	HLS     HLSConfig     `yaml:"hls"`
-	Logging LoggingConfig `yaml:"logging"`
+	Server       ServerConfig       `yaml:"server"`
+	Janus        JanusConfig        `yaml:"janus"`
+	HLS          HLSConfig          `yaml:"hls"`
+	Logging      LoggingConfig      `yaml:"logging"`
+	Registry     RegistryConfig     `yaml:"registry"`
+	OriginRouter OriginRouterConfig `yaml:"origin_router"`
+}
+
+// RegistryConfig holds the session ownership registry configuration (Redis).
+// Disabled by default so a standalone instance behaves exactly as before.
+type RegistryConfig struct {
+	Enabled       bool   `yaml:"enabled"`
+	RedisAddr     string `yaml:"redis_addr"`
+	RedisPassword string `yaml:"redis_password"`
+	RedisDB       int    `yaml:"redis_db"`
+	KeyPrefix     string `yaml:"key_prefix"`
+	// WorkerID identifies this instance in ownership records. Must match the
+	// identity Fleet Controller's streambridge LifecycleController.List()
+	// discovers it as, so a viewer-facing lookup and a placement lookup agree
+	// on the same instance.
+	WorkerID string `yaml:"worker_id"`
+	// OriginAddr is this instance's HTTP address, published in the ownership
+	// record for the Origin Router to proxy LL-HLS requests to (host:port).
+	OriginAddr string `yaml:"origin_addr"`
+	// SessionTTL is a coarse safety-net expiry on ownership records, guarding
+	// against a permanent leak if a crashed instance's record is never
+	// cleared. Not the primary cleanup path — that's still the existing
+	// grace-period unregister flow.
+	SessionTTL time.Duration `yaml:"session_ttl"`
+}
+
+// OriginRouterConfig configures the stateless HTTP reverse proxy that routes
+// viewer LL-HLS requests to whichever StreamBridge instance owns a session.
+type OriginRouterConfig struct {
+	ListenAddr string         `yaml:"listen_addr"`
+	Registry   RegistryConfig `yaml:"registry"`
+	// OwnershipCacheTTL bounds how long a resolved sessionID->owner lookup is
+	// cached locally before being re-read from the registry.
+	OwnershipCacheTTL time.Duration `yaml:"ownership_cache_ttl"`
+	// FleetController is used for the liveness cross-check (D4): before
+	// proxying, confirm the owning instance is still known-healthy rather
+	// than proxying into a dead address and hanging.
+	FleetController FleetControllerConfig `yaml:"fleet_controller"`
+}
+
+// FleetControllerConfig points the Origin Router at Fleet Controller's
+// FleetStatusService for the liveness cross-check in Epic D4.
+type FleetControllerConfig struct {
+	Enabled     bool   `yaml:"enabled"`
+	GRPCAddr    string `yaml:"grpc_addr"`
+	ServiceName string `yaml:"service_name"`
 }
 
 // ServerConfig holds gRPC server configuration
@@ -84,6 +131,20 @@ func Default() *Config {
 			Level:  "info",
 			Format: "text",
 			Output: "stdout",
+		},
+		Registry: RegistryConfig{
+			Enabled:    false,
+			RedisAddr:  "localhost:6379",
+			KeyPrefix:  "streambridge:",
+			SessionTTL: 24 * time.Hour,
+		},
+		OriginRouter: OriginRouterConfig{
+			ListenAddr:        ":8090",
+			OwnershipCacheTTL: 2 * time.Second,
+			FleetController: FleetControllerConfig{
+				Enabled:     false,
+				ServiceName: "streambridge",
+			},
 		},
 	}
 }
@@ -202,6 +263,59 @@ func (c *Config) applyEnvironment() {
 		}
 	}
 
+	// Registry config
+	if enabled := os.Getenv("REGISTRY_ENABLED"); enabled != "" {
+		if e, err := strconv.ParseBool(enabled); err == nil {
+			c.Registry.Enabled = e
+		}
+	}
+	if addr := os.Getenv("REGISTRY_REDIS_ADDR"); addr != "" {
+		c.Registry.RedisAddr = addr
+	}
+	if pass := os.Getenv("REGISTRY_REDIS_PASSWORD"); pass != "" {
+		c.Registry.RedisPassword = pass
+	}
+	if db := os.Getenv("REGISTRY_REDIS_DB"); db != "" {
+		if d, err := strconv.Atoi(db); err == nil {
+			c.Registry.RedisDB = d
+		}
+	}
+	if prefix := os.Getenv("REGISTRY_KEY_PREFIX"); prefix != "" {
+		c.Registry.KeyPrefix = prefix
+	}
+	if id := os.Getenv("REGISTRY_WORKER_ID"); id != "" {
+		c.Registry.WorkerID = id
+	}
+	if addr := os.Getenv("REGISTRY_ORIGIN_ADDR"); addr != "" {
+		c.Registry.OriginAddr = addr
+	}
+	if ttl := os.Getenv("REGISTRY_SESSION_TTL"); ttl != "" {
+		if t, err := time.ParseDuration(ttl); err == nil {
+			c.Registry.SessionTTL = t
+		}
+	}
+
+	// Origin Router config
+	if addr := os.Getenv("ORIGIN_ROUTER_LISTEN_ADDR"); addr != "" {
+		c.OriginRouter.ListenAddr = addr
+	}
+	if ttl := os.Getenv("ORIGIN_ROUTER_OWNERSHIP_CACHE_TTL"); ttl != "" {
+		if t, err := time.ParseDuration(ttl); err == nil {
+			c.OriginRouter.OwnershipCacheTTL = t
+		}
+	}
+	if enabled := os.Getenv("FLEET_CONTROLLER_ENABLED"); enabled != "" {
+		if e, err := strconv.ParseBool(enabled); err == nil {
+			c.OriginRouter.FleetController.Enabled = e
+		}
+	}
+	if addr := os.Getenv("FLEET_CONTROLLER_GRPC_ADDR"); addr != "" {
+		c.OriginRouter.FleetController.GRPCAddr = addr
+	}
+	if name := os.Getenv("FLEET_CONTROLLER_SERVICE_NAME"); name != "" {
+		c.OriginRouter.FleetController.ServiceName = name
+	}
+
 	// Logging config
 	if level := os.Getenv("LOG_LEVEL"); level != "" {
 		c.Logging.Level = level
@@ -257,6 +371,10 @@ func (c *Config) Validate() error {
 	}
 	if c.Logging.LibLevel != "" && !validLogLevels[c.Logging.LibLevel] {
 		return fmt.Errorf("invalid lib log level: %s", c.Logging.LibLevel)
+	}
+
+	if c.Registry.Enabled && c.Registry.RedisAddr == "" {
+		return fmt.Errorf("registry.redis_addr is required when registry is enabled")
 	}
 
 	return nil

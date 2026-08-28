@@ -1,0 +1,56 @@
+# Ownership Registry Redis (Epic C). This is StreamBridge's own registry —
+# entirely separate from any Redis Fleet Controller uses for its own state.
+#
+# Single replica, no PVC: this is a cache/registry, not durable data. It's a
+# named, accepted single point of failure for Phase 1 (see
+# docs/horizontal-scaling.md) — losing it only affects new session
+# placement/lookups, not already-established sessions being served directly.
+# Redis Sentinel/a managed Redis service is the documented upgrade path if
+# this needs to become HA.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: streambridge-registry-redis
+  labels:
+    app: streambridge-registry-redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: streambridge-registry-redis
+  template:
+    metadata:
+      labels:
+        app: streambridge-registry-redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - containerPort: 6379
+          readinessProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 2
+          livenessProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 5
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: streambridge-registry-redis
+spec:
+  selector:
+    app: streambridge-registry-redis
+  ports:
+    - port: 6379
+      targetPort: 6379

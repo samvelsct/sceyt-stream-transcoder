@@ -1,0 +1,73 @@
+# Origin Router (Epic D). Pure Go, no CGo/native-library dependency, no
+# WebRTC — a much simpler build than the streamer image. Stateless: safe to
+# run many replicas behind a plain Service, no session affinity needed at
+# this layer since routing state lives in Redis, not in the router process.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: streambridge-origin-router
+  labels:
+    app: streambridge-origin-router
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: streambridge-origin-router
+  template:
+    metadata:
+      labels:
+        app: streambridge-origin-router
+    spec:
+      containers:
+        - name: origin-router
+          image: streambridge-origin-router:latest
+          ports:
+            - name: http
+              containerPort: 8090
+          env:
+            - name: REGISTRY_ENABLED
+              value: "true"
+            - name: REGISTRY_REDIS_ADDR
+              value: "streambridge-registry-redis:6379"
+            # Epic D4 liveness cross-check — optional. If Fleet Controller
+            # isn't reachable from here, leave FLEET_CONTROLLER_ENABLED
+            # unset/false; the Origin Router still works, just without that
+            # cross-check (a crashed origin's sessions surface as proxy
+            # errors instead of clean 404s until the registry's safety-net
+            # TTL expires them — see docs/horizontal-scaling.md).
+            - name: FLEET_CONTROLLER_ENABLED
+              value: "true"
+            - name: FLEET_CONTROLLER_GRPC_ADDR
+              value: "vt-fleet-controller:9090"
+            - name: FLEET_CONTROLLER_SERVICE_NAME
+              value: "streambridge"
+
+          readinessProbe:
+            httpGet: { path: /healthcheck, port: 8090 }
+            initialDelaySeconds: 3
+          livenessProbe:
+            httpGet: { path: /healthcheck, port: 8090 }
+            initialDelaySeconds: 5
+
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "128Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
+---
+# The one Service viewers actually hit. Exposing this externally is a
+# cluster-specific decision (LoadBalancer vs. Ingress) — see
+# docs/horizontal-scaling.md.
+apiVersion: v1
+kind: Service
+metadata:
+  name: streambridge-origin-router
+spec:
+  selector:
+    app: streambridge-origin-router
+  ports:
+    - name: http
+      port: 8090
+      targetPort: 8090

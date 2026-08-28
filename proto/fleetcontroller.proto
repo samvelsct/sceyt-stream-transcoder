@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+package fleetcontroller.v1;
+
+option go_package = "vt-stream-transcoder/api/fleetpb";
+
+import "google/protobuf/timestamp.proto";
+
+service FleetStatusService {
+  rpc ListInstances(ListInstancesRequest) returns (ListInstancesResponse);
+  rpc GetInstance(GetInstanceRequest) returns (GetInstanceResponse);
+  rpc SelectHost(SelectHostRequest) returns (SelectHostResponse);
+}
+
+message ListInstancesRequest {
+  string service_name = 1;
+  repeated InstanceStatusState statuses = 2;
+  bool placement_eligible = 3;
+}
+
+message ListInstancesResponse {
+  repeated InstanceStatus instances = 1;
+}
+
+message GetInstanceRequest {
+  string service_name = 1;
+  string instance_id = 2;
+}
+
+message GetInstanceResponse {
+  InstanceStatus instance = 1;
+}
+
+message SelectHostRequest {
+  string service_name = 1;
+}
+
+message SelectHostResponse {
+  string host = 1;
+}
+
+enum InstanceStatusState {
+  INSTANCE_STATUS_STATE_UNSPECIFIED = 0;
+  INSTANCE_STATUS_STATE_STARTING = 1;
+  INSTANCE_STATUS_STATE_READY = 2;
+  INSTANCE_STATUS_STATE_BUSY = 3;
+  INSTANCE_STATUS_STATE_DRAINING = 4;
+  INSTANCE_STATUS_STATE_UNHEALTHY = 5;
+}
+
+message InstanceStatus {
+  string service_name = 1;
+  string instance_id = 2;
+  string address = 3;
+  InstanceStatusState status = 4;
+  string reason = 5;
+  int32 active_sessions = 6;
+  double cpu_percent = 7;
+  double memory_percent = 8;
+  google.protobuf.Timestamp last_seen_at = 9;
+  google.protobuf.Timestamp calculated_at = 10;
+  map<string, string> metadata = 11;
+}
