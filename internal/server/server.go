@@ -483,6 +483,36 @@ func (s *Server) SetVideoOn(_ context.Context, req *pb.SetVideoOnRequest) (*pb.S
 	}, nil
 }
 
+func (s *Server) SetHold(_ context.Context, req *pb.SetHoldRequest) (*pb.SetHoldResponse, error) {
+	zlog.Info().Msgf("[%s] SetHold: %v", req.SessionId, req)
+
+	zlog.Info().Msgf("[%s][MUTEX] SetHold: read lock", req.SessionId)
+	s.mu.RLock()
+	session, exists := s.sessions[req.SessionId]
+	s.mu.RUnlock()
+	zlog.Info().Msgf("[%s][MUTEX] SetHold: read unlocked", req.SessionId)
+
+	if !exists {
+		return &pb.SetHoldResponse{
+			Success: false,
+			Message: "session not found",
+		}, status.Error(codes.NotFound, "session not found")
+	}
+
+	err := session.SetHold(req.UserId, req.ClientId, req.Hold)
+	if err != nil {
+		return &pb.SetHoldResponse{
+			Success: false,
+			Message: fmt.Sprintf("failed to set hold: %v", err),
+		}, status.Error(codes.Internal, err.Error())
+	}
+
+	return &pb.SetHoldResponse{
+		Success: true,
+		Message: "hold status set successfully",
+	}, nil
+}
+
 // WriteID3Tag writes a custom ID3 tag to the HLS stream
 func (s *Server) WriteID3Tag(_ context.Context, req *pb.WriteID3TagRequest) (*pb.WriteID3TagResponse, error) {
 	zlog.Info().Msgf("[%s] WriteID3Tag: %v", req.SessionId, req)

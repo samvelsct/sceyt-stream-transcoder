@@ -400,6 +400,32 @@ WEBRTC_HLS_API int webrtc_hls_set_video_on(
 );
 
 /**
+ * @brief Set the hold status for a participant
+ *
+ * Writes an ID3 "hold" tag to the HLS stream indicating that a participant has
+ * been put on hold or taken off hold. This allows HLS players to display hold status.
+ *
+ * @param session Session handle
+ * @param user_id User identifier string (must not be NULL)
+ * @param client_id Client identifier string (must not be NULL)
+ * @param hold Hold status: 1=on hold, 0=not on hold
+ * @return WEBRTC_HLS_SUCCESS on success, error code on failure
+ *
+ * @retval WEBRTC_HLS_SUCCESS Hold status tag written successfully
+ * @retval WEBRTC_HLS_ERROR_INVALID_PARAM Invalid parameter (NULL pointer)
+ * @retval WEBRTC_HLS_ERROR Failed to write tag
+ *
+ * @note The ID3 tag contains JSON: {"userId":"user_id/client_id","hold":true/false}
+ * @see webrtc_hls_set_mute(), webrtc_hls_set_video_on(), webrtc_hls_write_id3_tag()
+ */
+WEBRTC_HLS_API int webrtc_hls_set_hold(
+    webrtc_hls_session_t session,
+    const char *user_id,
+    const char *client_id,
+    int hold
+);
+
+/**
  * Session information and queries
  */
 

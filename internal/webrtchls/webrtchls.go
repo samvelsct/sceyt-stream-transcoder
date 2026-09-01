@@ -310,6 +310,24 @@ func (s *Session) SetVideoOn(userID, clientID string, videoOn bool) error {
 	return codeToError(result)
 }
 
+// SetHold sets the hold status for a participant.
+// Writes an ID3 "hold" tag to the HLS stream.
+func (s *Session) SetHold(userID, clientID string, hold bool) error {
+	cUserID := C.CString(userID)
+	defer C.free(unsafe.Pointer(cUserID))
+
+	cClientID := C.CString(clientID)
+	defer C.free(unsafe.Pointer(cClientID))
+
+	holdVal := C.int(0)
+	if hold {
+		holdVal = C.int(1)
+	}
+
+	result := C.webrtc_hls_set_hold(s.handle, cUserID, cClientID, holdVal)
+	return codeToError(result)
+}
+
 // SessionInfo contains information about a session.
 type SessionInfo struct {
 	ParticipantCount int      // Number of active participants
