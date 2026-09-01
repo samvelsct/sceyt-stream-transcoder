@@ -31,10 +31,6 @@ type Registry struct {
 	rdb    *redis.Client
 	prefix string
 	ttl    time.Duration
-
-	registerScript *redis.Script
-	fenceScript    *redis.Script
-	deleteScript   *redis.Script
 }
 
 // New creates a Registry. ttl is the coarse safety-net expiry applied to
@@ -45,86 +41,65 @@ func New(rdb *redis.Client, keyPrefix string, ttl time.Duration) *Registry {
 		ttl = 24 * time.Hour
 	}
 	return &Registry{
-		rdb:            rdb,
-		prefix:         keyPrefix,
-		ttl:            ttl,
-		registerScript: redis.NewScript(registerLuaScript),
-		fenceScript:    redis.NewScript(fenceLuaScript),
-		deleteScript:   redis.NewScript(deleteLuaScript),
+		rdb:    rdb,
+		prefix: keyPrefix,
+		ttl:    ttl,
 	}
 }
 
-func (r *Registry) hashKey(sessionID string) string {
-	return r.prefix + "session:" + sessionID
-}
-
+// genKey holds a monotonically increasing counter for sessionID — the only
+// thing that needs a real atomic operation (INCR, a single command, safe
+// under twemproxy since it's not a compound read-then-write).
 func (r *Registry) genKey(sessionID string) string {
 	return r.prefix + "session:" + sessionID + ":gen"
 }
 
-// registerLuaScript atomically bumps the per-session generation counter and
-// (re)writes the record under the new generation. Always succeeds — a fresh
-// registration for a sessionID is, by definition, the new legitimate owner
-// (see package docs on what generation fencing does and doesn't protect
-// against).
-const registerLuaScript = `
-local gen = redis.call('INCR', KEYS[2])
-redis.call('HSET', KEYS[1],
-  'sessionId', ARGV[1],
-  'workerId', ARGV[2],
-  'origin', ARGV[3],
-  'generation', gen,
-  'status', ARGV[4],
-  'leaseExpiresAt', ARGV[5])
-redis.call('EXPIRE', KEYS[1], ARGV[6])
-redis.call('EXPIRE', KEYS[2], ARGV[6])
-return gen
-`
+// recordKey holds the immutable ownership record for one specific
+// generation of sessionID. Immutable is the load-bearing property: once
+// Register mints a generation via INCR, that generation's key is uniquely
+// its own — no other call can ever be racing to write the *same* key, so
+// there's nothing to compare-and-swap. A stale caller presenting an old
+// generation can only ever touch that old generation's own (already
+// unread) key; it can never collide with whatever the current generation
+// is, because they're different Redis keys by construction. Readers
+// (Get) always resolve the current generation via genKey first, then read
+// exactly one recordKey — so a write to a superseded recordKey has no
+// observable effect on anyone.
+func (r *Registry) recordKey(sessionID string, generation int64) string {
+	return r.prefix + "session:" + sessionID + ":" + strconv.FormatInt(generation, 10)
+}
 
-// fenceLuaScript updates a single field only if the caller's generation
-// still matches the record's current generation.
-const fenceLuaScript = `
-local cur = redis.call('HGET', KEYS[1], 'generation')
-if not cur or cur ~= ARGV[1] then
-  return 0
-end
-redis.call('HSET', KEYS[1], ARGV[2], ARGV[3])
-if tonumber(ARGV[4]) > 0 then
-  redis.call('EXPIRE', KEYS[1], ARGV[4])
-end
-return 1
-`
-
-// deleteLuaScript deletes a record only if the caller's generation still
-// matches — mirrors the existing "only delete if this is still the same
-// store" re-registration guard in httpserver.UnregisterSession.
-const deleteLuaScript = `
-local cur = redis.call('HGET', KEYS[1], 'generation')
-if cur and cur == ARGV[1] then
-  redis.call('DEL', KEYS[1])
-  return 1
-end
-return 0
-`
-
-// Register creates (or re-creates) the ownership record for sessionID under
-// workerID/origin, bumping the generation. Called once, at CreateSession
-// success (internal/server/server.go's CreateSession handler).
+// Register creates the ownership record for sessionID under
+// workerID/origin, at a freshly minted generation. Called once, at
+// CreateSession success (internal/server/server.go's CreateSession
+// handler). Always succeeds — a fresh registration for a sessionID is, by
+// definition, the new legitimate owner (see the package doc on what
+// generation fencing does and doesn't protect against).
 func (r *Registry) Register(ctx context.Context, sessionID, workerID, origin string) (generation int64, err error) {
+	gen, err := r.rdb.Incr(ctx, r.genKey(sessionID)).Result()
+	if err != nil {
+		return 0, fmt.Errorf("registry: register %s: incr generation: %w", sessionID, err)
+	}
+	ttlSeconds := int(r.ttl.Seconds())
+	if err := r.rdb.Expire(ctx, r.genKey(sessionID), r.ttl).Err(); err != nil {
+		return 0, fmt.Errorf("registry: register %s: expire generation counter: %w", sessionID, err)
+	}
+
 	now := time.Now()
 	lease := now.Add(r.ttl)
-	res, err := r.registerScript.Run(ctx, r.rdb,
-		[]string{r.hashKey(sessionID), r.genKey(sessionID)},
-		sessionID, workerID, origin, string(StatusActive),
-		strconv.FormatInt(lease.UnixMilli(), 10),
-		int(r.ttl.Seconds()),
-	).Result()
-	if err != nil {
-		return 0, fmt.Errorf("registry: register %s: %w", sessionID, err)
+	key := r.recordKey(sessionID, gen)
+	if err := r.rdb.HSet(ctx, key,
+		"sessionId", sessionID,
+		"workerId", workerID,
+		"origin", origin,
+		"generation", gen,
+		"status", string(StatusActive),
+		"leaseExpiresAt", lease.UnixMilli(),
+	).Err(); err != nil {
+		return 0, fmt.Errorf("registry: register %s: write record: %w", sessionID, err)
 	}
-	gen, ok := res.(int64)
-	if !ok {
-		return 0, fmt.Errorf("registry: register %s: unexpected script result %T", sessionID, res)
+	if err := r.rdb.Expire(ctx, key, time.Duration(ttlSeconds)*time.Second).Err(); err != nil {
+		return 0, fmt.Errorf("registry: register %s: expire record: %w", sessionID, err)
 	}
 	return gen, nil
 }
@@ -148,52 +123,101 @@ func (r *Registry) Refresh(ctx context.Context, sessionID string, generation int
 		strconv.FormatInt(lease.UnixMilli(), 10), int(r.ttl.Seconds()))
 }
 
+// setField checks generation against the current pointer (genKey) and,
+// only if it still matches, writes directly to that generation's own
+// recordKey. The read-then-write here is two plain commands, not one
+// atomic unit — but that's safe by construction (see recordKey's doc): the
+// write can only ever land on the caller's own presented generation's key,
+// which nothing else is ever writing to concurrently, and which no reader
+// consults once genKey has moved past it. The one thing NOT fully
+// linearizable under a very tight race is the ErrNotOwner-vs-success
+// *return value* itself (genKey could tick over in the gap between the
+// read and the write) — that's a rare, harmless mislabeling for logging
+// purposes, never a data-safety issue, since the write still only ever
+// touches a key nobody reads once it's stale.
 func (r *Registry) setField(ctx context.Context, sessionID string, generation int64, field, value string, ttlSeconds int) error {
-	res, err := r.fenceScript.Run(ctx, r.rdb,
-		[]string{r.hashKey(sessionID)},
-		strconv.FormatInt(generation, 10), field, value, ttlSeconds,
-	).Result()
+	cur, err := r.currentGeneration(ctx, sessionID)
 	if err != nil {
+		return err
+	}
+	if cur != generation {
+		return ErrNotOwner
+	}
+
+	key := r.recordKey(sessionID, generation)
+	if err := r.rdb.HSet(ctx, key, field, value).Err(); err != nil {
 		return fmt.Errorf("registry: update %s: %w", sessionID, err)
 	}
-	if n, _ := res.(int64); n == 0 {
-		return ErrNotOwner
+	if ttlSeconds > 0 {
+		if err := r.rdb.Expire(ctx, key, time.Duration(ttlSeconds)*time.Second).Err(); err != nil {
+			return fmt.Errorf("registry: update %s: expire: %w", sessionID, err)
+		}
 	}
 	return nil
 }
 
 // Delete removes a session's ownership record, fenced on generation so a
 // late-firing grace-period timer from a superseded registration can never
-// delete a newer owner's record. Called from the same grace-period
-// time.AfterFunc that already clears the in-memory HLS store
+// delete a newer owner's record — structurally true here regardless of
+// timing, since Delete only ever issues DEL against the caller's own
+// presented generation's key (see recordKey's doc), which is a different
+// Redis key from whatever the current generation is. Called from the same
+// grace-period time.AfterFunc that already clears the in-memory HLS store
 // (internal/httpserver/server.go:594-617).
 func (r *Registry) Delete(ctx context.Context, sessionID string, generation int64) error {
-	res, err := r.deleteScript.Run(ctx, r.rdb,
-		[]string{r.hashKey(sessionID)},
-		strconv.FormatInt(generation, 10),
-	).Result()
+	cur, err := r.currentGeneration(ctx, sessionID)
 	if err != nil {
-		return fmt.Errorf("registry: delete %s: %w", sessionID, err)
+		return err
 	}
-	if n, _ := res.(int64); n == 0 {
+	if cur != generation {
 		return ErrNotOwner
+	}
+	if err := r.rdb.Del(ctx, r.recordKey(sessionID, generation)).Err(); err != nil {
+		return fmt.Errorf("registry: delete %s: %w", sessionID, err)
 	}
 	return nil
 }
 
+// currentGeneration reads the generation pointer for sessionID.
+// ErrNotFound means no Register call has ever happened for this sessionID.
+func (r *Registry) currentGeneration(ctx context.Context, sessionID string) (int64, error) {
+	val, err := r.rdb.Get(ctx, r.genKey(sessionID)).Result()
+	if errors.Is(err, redis.Nil) {
+		return 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, fmt.Errorf("registry: read generation for %s: %w", sessionID, err)
+	}
+	gen, err := strconv.ParseInt(val, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("registry: read generation for %s: invalid value %q: %w", sessionID, val, err)
+	}
+	return gen, nil
+}
+
 // Get resolves a session's current ownership record. Used by the Origin
 // Router (Epic D1) on every viewer request not already served from its
-// local short-TTL cache.
+// local short-TTL cache. Two plain reads (genKey then that generation's
+// recordKey) instead of one HGETALL — the cost of not having a single
+// atomic "read current record" primitive available, acceptable given
+// results are already cached locally for OwnershipCacheTTL.
 func (r *Registry) Get(ctx context.Context, sessionID string) (*Record, error) {
-	vals, err := r.rdb.HGetAll(ctx, r.hashKey(sessionID)).Result()
+	gen, err := r.currentGeneration(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	vals, err := r.rdb.HGetAll(ctx, r.recordKey(sessionID, gen)).Result()
 	if err != nil {
 		return nil, fmt.Errorf("registry: get %s: %w", sessionID, err)
 	}
 	if len(vals) == 0 {
+		// genKey points at a generation whose record is gone (deleted or
+		// expired) — same observable outcome as no registration at all.
 		return nil, ErrNotFound
 	}
 
-	gen, err := strconv.ParseInt(vals["generation"], 10, 64)
+	parsedGen, err := strconv.ParseInt(vals["generation"], 10, 64)
 	if err != nil {
 		return nil, fmt.Errorf("registry: get %s: invalid generation %q: %w", sessionID, vals["generation"], err)
 	}
@@ -206,7 +230,7 @@ func (r *Registry) Get(ctx context.Context, sessionID string) (*Record, error) {
 		SessionID:      vals["sessionId"],
 		WorkerID:       vals["workerId"],
 		Origin:         vals["origin"],
-		Generation:     gen,
+		Generation:     parsedGen,
 		Status:         Status(vals["status"]),
 		LeaseExpiresAt: lease,
 	}, nil

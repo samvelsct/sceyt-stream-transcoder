@@ -60,19 +60,29 @@ every reconcile tick with `ErrHandlerNotRegistered`, regardless of `desiredCount
 
 ### Ownership Registry (`internal/registry`)
 
-Redis-backed, keyed at `{prefix}session:{sessionID}` as a Redis hash: `workerId`, `origin` (host:port),
-`generation`, `status` (`ACTIVE`/`FINALIZING`), `leaseExpiresAt`.
+Redis-backed. No `EVAL`/Lua scripting and no `WATCH`/`MULTI`/`EXEC` transactions — the Redis behind this may
+be a twemproxy instance, which implements neither, so generation-fencing safety comes from the key scheme
+itself instead of compare-and-swap:
+
+- `{prefix}session:{sessionID}:gen` — a plain `INCR`-only counter, the current-generation pointer.
+- `{prefix}session:{sessionID}:{generation}` — an **immutable per-generation** Redis hash: `workerId`,
+  `origin` (host:port), `generation`, `status` (`ACTIVE`/`FINALIZING`), `leaseExpiresAt`. Each `Register`
+  call mints a fresh generation via `INCR` and writes to that generation's own key — a key nothing else is
+  ever concurrently writing to, so there's nothing to race. Readers always resolve the current generation
+  from the counter first, then read exactly that one record key.
 
 - **Written by the StreamBridge instance itself**, at `CreateSession` success
   (`internal/server/server.go`'s `CreateSession`, right after the session is stored in `s.sessions`) — no
   external allocator is involved in this step; the instance is registering ownership of a session it just
-  created, on its own gRPC-driven `CreateSession` call. `Registration` bumps a per-session generation counter
-  atomically (a small Lua script) — one Redis round trip.
+  created, on its own gRPC-driven `CreateSession` call.
 - **Generation fencing.** Every fresh registration for a `sessionID` gets a new, strictly higher generation.
-  Any later write (`Finalize`, `Delete`) presenting a stale generation is rejected with `ErrNotOwner` rather
-  than silently no-op'd or, worse, clobbering a newer registration. This is what stops a duplicate
-  `CreateSession` call landing on two different instances, or a zombie process waking back up, from
-  corrupting a session that's already moved on.
+  `Finalize`/`Delete` write directly to the caller's own presented generation's key, never anyone else's —
+  structurally impossible to collide, since a stale generation number always maps to a different Redis key
+  than whatever's current. A stale caller is rejected with `ErrNotOwner` (checked via a plain, non-atomic
+  read of the counter before the write — a tiny race can misreport that return value under extreme
+  concurrent timing, but never lets a stale write reach the current generation's actual data). This is what
+  stops a duplicate `CreateSession` call landing on two different instances, or a zombie process waking back
+  up, from corrupting a session that's already moved on.
 - **Cleared by the existing grace-period timer**, not a new one:
   `internal/httpserver/server.go`'s `UnregisterSession` already keeps a destroyed session's HLS store around
   for `unregisterGracePeriod` (10s) so in-flight playlist polls still see a final `#EXT-X-ENDLIST` instead of

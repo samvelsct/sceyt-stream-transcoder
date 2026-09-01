@@ -36,6 +36,19 @@ cli: proto
 	@echo "Building streambridge CLI..."
 	go build -o bin/streambridge-cli ./cmd/streambridge-cli
 
+# Build the Origin Router (Epic D) -- pure Go, no CGo, unlike the main
+# server build above.
+origin-router:
+	@echo "Building streambridge-origin-router..."
+	CGO_ENABLED=0 go build -o bin/streambridge-origin-router ./cmd/streambridge-origin-router
+
+# Build the Origin Router's Docker image (separate, lighter Dockerfile --
+# see deploy/docker/origin-router/Dockerfile for why it isn't a stage in the
+# main one).
+docker-origin-router:
+	@echo "Building streambridge-origin-router Docker image..."
+	docker build -f deploy/docker/origin-router/Dockerfile -t streambridge-origin-router:latest .
+
 # Build example clients
 examples: proto
 	@echo "Building Go example client..."
@@ -60,6 +73,8 @@ help:
 	@echo "  make proto     - Generate protobuf Go files"
 	@echo "  make build     - Build the server (includes proto generation)"
 	@echo "  make cli       - Build the CLI client"
+	@echo "  make origin-router - Build the Origin Router (Epic D, pure Go)"
+	@echo "  make docker-origin-router - Build the Origin Router's Docker image"
 	@echo "  make examples  - Build example clients"
 	@echo "  make all       - Build server and CLI"
 	@echo "  make run       - Build and run the server"
