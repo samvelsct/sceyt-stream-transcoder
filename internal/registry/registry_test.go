@@ -2,11 +2,12 @@ package registry
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
-	"github.com/redis/go-redis/v9"
+	"github.com/go-redis/redis/v8"
 )
 
 func newTestRegistry(t *testing.T, ttl time.Duration) *Registry {
@@ -192,5 +193,67 @@ func TestRegister_ExpiresAfterTTL(t *testing.T) {
 
 	if _, err := r.Get(context.Background(), "sess-1"); err != ErrNotFound {
 		t.Fatalf("expected the coarse safety-net TTL to expire the record, got %v", err)
+	}
+}
+
+func TestWithRetry_SucceedsWithoutRetryOnNilError(t *testing.T) {
+	calls := 0
+	err := withRetry(func() error {
+		calls++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("withRetry: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected exactly 1 call, got %d", calls)
+	}
+}
+
+func TestWithRetry_RetriesTransientErrorsThenSucceeds(t *testing.T) {
+	calls := 0
+	err := withRetry(func() error {
+		calls++
+		if calls < retryAttempts {
+			return errors.New("simulated EOF")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("withRetry: %v", err)
+	}
+	if calls != retryAttempts {
+		t.Fatalf("expected %d calls (fails until the last attempt), got %d", retryAttempts, calls)
+	}
+}
+
+func TestWithRetry_GivesUpAfterRetryAttemptsAndReturnsLastError(t *testing.T) {
+	calls := 0
+	sentinel := errors.New("simulated persistent EOF")
+	err := withRetry(func() error {
+		calls++
+		return sentinel
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected the last error to propagate, got %v", err)
+	}
+	if calls != retryAttempts {
+		t.Fatalf("expected exactly %d attempts, got %d", retryAttempts, calls)
+	}
+}
+
+func TestWithRetry_DoesNotRetryErrNotFoundOrErrNotOwner(t *testing.T) {
+	for _, sentinel := range []error{ErrNotFound, ErrNotOwner} {
+		calls := 0
+		err := withRetry(func() error {
+			calls++
+			return sentinel
+		})
+		if !errors.Is(err, sentinel) {
+			t.Fatalf("expected %v to propagate, got %v", sentinel, err)
+		}
+		if calls != 1 {
+			t.Fatalf("expected %v to short-circuit after 1 call (not a transient failure), got %d calls", sentinel, calls)
+		}
 	}
 }

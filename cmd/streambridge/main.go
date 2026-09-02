@@ -20,7 +20,7 @@ import (
 	"vt-stream-transcoder/internal/server"
 	"vt-stream-transcoder/internal/webrtchls"
 
-	"github.com/redis/go-redis/v9"
+	"github.com/go-redis/redis/v8"
 	"github.com/rs/zerolog"
 	zlog "github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
@@ -270,6 +270,26 @@ func main() {
 			Addr:     cfg.Registry.RedisAddr,
 			Password: cfg.Registry.RedisPassword,
 			DB:       cfg.Registry.RedisDB,
+			// go-redis v9 defaulted to negotiating RESP3 via HELLO and
+			// sending CLIENT SETINFO on every new connection -- twemproxy
+			// doesn't understand either and closes the TCP connection
+			// outright instead of erroring, which is what actually caused
+			// the "EOF" failures (confirmed live against twemproxy
+			// directly). go-redis v8 (this) predates both behaviors, so
+			// there's no equivalent option needed here -- matches
+			// vt-api-service, a sibling service against the same
+			// twemproxy that's never hit this.
+			//
+			// twemproxy (or a backend Redis behind it) also closes idle
+			// connections on its own timeout without telling the client;
+			// IdleTimeout retires connections client-side well before any
+			// plausible server-side timeout so the pool never hands out
+			// one the server already killed.
+			IdleTimeout: 60 * time.Second,
+			// go-redis v8 defaults to 0 (no retry); vt-api-service runs 5
+			// against the same twemproxy -- matching that, on top of the
+			// package-level retry in internal/registry (defense in depth).
+			MaxRetries: 5,
 		})
 		defer rdb.Close()
 

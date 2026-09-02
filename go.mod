@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/alicebob/miniredis/v2 v2.38.0
-	github.com/redis/go-redis/v9 v9.7.3
+	github.com/go-redis/redis/v8 v8.11.5
 	github.com/rs/zerolog v1.34.0
 	google.golang.org/grpc v1.80.0
 	google.golang.org/protobuf v1.36.11

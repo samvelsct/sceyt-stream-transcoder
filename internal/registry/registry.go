@@ -15,8 +15,41 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/redis/go-redis/v9"
+	"github.com/go-redis/redis/v8"
 )
+
+// retryAttempts/retryBaseDelay bound a defense-in-depth retry applied to
+// every Redis call in this package, on top of go-redis's own client-level
+// MaxRetries. Observed live in staging: a bare "EOF" on both reads and
+// writes against twemproxy, on connections both idle-reused and brand new
+// -- go-redis's built-in retry isn't catching every occurrence, so this is
+// a second, package-level layer. Safe to retry Register() wholesale (not
+// just the failing sub-step) because a fresh registration is, by design,
+// always a new legitimate owner (see Register's doc) -- a retry just mints
+// a higher generation and orphans whatever partial state the failed
+// attempt left, which nothing ever reads again (see recordKey's doc).
+const (
+	retryAttempts  = 3
+	retryBaseDelay = 50 * time.Millisecond
+)
+
+// withRetry runs fn up to retryAttempts times with a short linear backoff
+// between attempts. Does not retry ErrNotFound (a valid "key doesn't
+// exist" response, not a transient failure) or ErrNotOwner (a real fencing
+// rejection) -- only genuine call errors, e.g. connection-level EOF.
+func withRetry(fn func() error) error {
+	var err error
+	for attempt := 0; attempt < retryAttempts; attempt++ {
+		err = fn()
+		if err == nil || errors.Is(err, ErrNotFound) || errors.Is(err, ErrNotOwner) {
+			return err
+		}
+		if attempt < retryAttempts-1 {
+			time.Sleep(retryBaseDelay * time.Duration(attempt+1))
+		}
+	}
+	return err
+}
 
 // ErrNotOwner is returned when a caller tries to update or delete a record
 // under a generation that no longer matches the current one — i.e. a stale
@@ -76,6 +109,15 @@ func (r *Registry) recordKey(sessionID string, generation int64) string {
 // definition, the new legitimate owner (see the package doc on what
 // generation fencing does and doesn't protect against).
 func (r *Registry) Register(ctx context.Context, sessionID, workerID, origin string) (generation int64, err error) {
+	err = withRetry(func() error {
+		var innerErr error
+		generation, innerErr = r.register(ctx, sessionID, workerID, origin)
+		return innerErr
+	})
+	return generation, err
+}
+
+func (r *Registry) register(ctx context.Context, sessionID, workerID, origin string) (generation int64, err error) {
 	gen, err := r.rdb.Incr(ctx, r.genKey(sessionID)).Result()
 	if err != nil {
 		return 0, fmt.Errorf("registry: register %s: incr generation: %w", sessionID, err)
@@ -136,6 +178,12 @@ func (r *Registry) Refresh(ctx context.Context, sessionID string, generation int
 // purposes, never a data-safety issue, since the write still only ever
 // touches a key nobody reads once it's stale.
 func (r *Registry) setField(ctx context.Context, sessionID string, generation int64, field, value string, ttlSeconds int) error {
+	return withRetry(func() error {
+		return r.setFieldOnce(ctx, sessionID, generation, field, value, ttlSeconds)
+	})
+}
+
+func (r *Registry) setFieldOnce(ctx context.Context, sessionID string, generation int64, field, value string, ttlSeconds int) error {
 	cur, err := r.currentGeneration(ctx, sessionID)
 	if err != nil {
 		return err
@@ -165,6 +213,12 @@ func (r *Registry) setField(ctx context.Context, sessionID string, generation in
 // grace-period time.AfterFunc that already clears the in-memory HLS store
 // (internal/httpserver/server.go:594-617).
 func (r *Registry) Delete(ctx context.Context, sessionID string, generation int64) error {
+	return withRetry(func() error {
+		return r.deleteOnce(ctx, sessionID, generation)
+	})
+}
+
+func (r *Registry) deleteOnce(ctx context.Context, sessionID string, generation int64) error {
 	cur, err := r.currentGeneration(ctx, sessionID)
 	if err != nil {
 		return err
@@ -202,6 +256,16 @@ func (r *Registry) currentGeneration(ctx context.Context, sessionID string) (int
 // atomic "read current record" primitive available, acceptable given
 // results are already cached locally for OwnershipCacheTTL.
 func (r *Registry) Get(ctx context.Context, sessionID string) (*Record, error) {
+	var rec *Record
+	err := withRetry(func() error {
+		var innerErr error
+		rec, innerErr = r.getOnce(ctx, sessionID)
+		return innerErr
+	})
+	return rec, err
+}
+
+func (r *Registry) getOnce(ctx context.Context, sessionID string) (*Record, error) {
 	gen, err := r.currentGeneration(ctx, sessionID)
 	if err != nil {
 		return nil, err
