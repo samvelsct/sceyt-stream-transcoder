@@ -126,6 +126,15 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	rec, err := r.resolve(req.Context(), sessionID)
 	if err != nil {
 		if errors.Is(err, registry.ErrNotFound) {
+			// Deliberately WARN, not silent: an unknown sessionID is
+			// expected for a genuinely bogus/expired one, but it's also
+			// exactly what a session whose CreateSession-time registry
+			// Register() call failed looks like (e.g. a transient
+			// twemproxy blip) -- that case is a live-viewer-facing bug,
+			// not routine behavior, and was previously invisible in these
+			// logs. Not cached (see resolve()), so this fires on every
+			// request for the affected session, not just the first.
+			zlog.Warn().Msgf("[%s] origin router: session not found in registry", sessionID)
 			http.Error(w, "session "+sessionID+" not found", http.StatusNotFound)
 			return
 		}

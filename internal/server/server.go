@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sync"
+	"time"
 	"vt-stream-transcoder/internal/webrtchls"
 
 	pb "vt-stream-transcoder/api"
@@ -231,9 +232,19 @@ func (s *Server) CreateSession(ctx context.Context, req *pb.CreateSessionRequest
 	// can find this instance for viewer LL-HLS requests. Best-effort: a
 	// registry failure here doesn't fail session creation — it just means
 	// the Origin Router can't route to this session until the registry
-	// recovers, which is no worse than the pre-registry world.
+	// recovers, which is no worse than the pre-registry world. Bounded with
+	// its own short timeout, independent of ctx's ambient deadline: this
+	// call (and its internal retries, see internal/registry's withRetry)
+	// runs under CreateSession's write lock, blocking AddInput and every
+	// other call for this session behind it — observed live staying stuck
+	// for the full ~5s CreateSession deadline once retries stopped
+	// fast-failing (bare EOF) and started hanging instead. "Best-effort"
+	// has to mean fast-and-bounded, not "retry until the caller's own
+	// deadline kills it."
 	if s.registry != nil {
-		gen, regErr := s.registry.Register(ctx, req.SessionId, s.workerID, s.originAddr)
+		registryCtx, registryCancel := context.WithTimeout(ctx, 1*time.Second)
+		gen, regErr := s.registry.Register(registryCtx, req.SessionId, s.workerID, s.originAddr)
+		registryCancel()
 		if regErr != nil {
 			zlog.Warn().Err(regErr).Msgf("[%s] Failed to publish ownership registry record", req.SessionId)
 		} else {
@@ -283,9 +294,15 @@ func (s *Server) DestroySession(ctx context.Context, req *pb.DestroySessionReque
 	// Mark the ownership record FINALIZING (Epic C2) — the actual delete
 	// happens on httpserver's existing grace-period timer, alongside the
 	// in-memory HLS store eviction, via SetGeneration/SetRegistryDeleter.
+	// Same bounded-timeout reasoning as CreateSession's Register call: this
+	// runs under DestroySession's write lock, so it must stay fast even
+	// when the registry backend is having trouble.
 	if s.registry != nil {
 		if gen, ok := s.generations[req.SessionId]; ok {
-			if finErr := s.registry.Finalize(ctx, req.SessionId, gen); finErr != nil {
+			finalizeCtx, finalizeCancel := context.WithTimeout(ctx, 1*time.Second)
+			finErr := s.registry.Finalize(finalizeCtx, req.SessionId, gen)
+			finalizeCancel()
+			if finErr != nil {
 				zlog.Warn().Err(finErr).Msgf("[%s] Failed to finalize ownership registry record", req.SessionId)
 			}
 		}
@@ -313,8 +330,9 @@ func (s *Server) DestroySession(ctx context.Context, req *pb.DestroySessionReque
 		heapDelta := int64(m2.HeapAlloc) - int64(m1.HeapAlloc)
 		mallocsDelta := m2.Mallocs - m1.Mallocs
 		freesDelta := m2.Frees - m1.Frees
+		liveObjectsDelta := int64(mallocsDelta) - int64(freesDelta)
 
-		zlog.Info().Msgf("[%s] Session memory statistics:\n\ttotal_allocated_bytes=%d\n\theap_delta_bytes=%d\n\tmallocs=%d\n\tfrees=%d\n\tlive_objects=%d", req.SessionId, allocated, heapDelta, mallocsDelta, freesDelta, mallocsDelta-freesDelta)
+		zlog.Info().Msgf("[%s] Session memory statistics:\n\ttotal_allocated_bytes=%d\n\theap_delta_bytes=%d\n\tmallocs=%d\n\tfrees=%d\n\tlive_objects=%d", req.SessionId, allocated, heapDelta, mallocsDelta, freesDelta, liveObjectsDelta)
 	}
 
 	zlog.Info().Msgf("[%s] DestroySession: exit", req.SessionId)

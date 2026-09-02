@@ -19,7 +19,7 @@ import (
 	"vt-stream-transcoder/internal/originrouter"
 	"vt-stream-transcoder/internal/registry"
 
-	"github.com/redis/go-redis/v9"
+	"github.com/go-redis/redis/v8"
 	"github.com/rs/zerolog"
 	zlog "github.com/rs/zerolog/log"
 )
@@ -47,6 +47,18 @@ func main() {
 		Addr:     cfg.Registry.RedisAddr,
 		Password: cfg.Registry.RedisPassword,
 		DB:       cfg.Registry.RedisDB,
+		// See the matching comment in cmd/streambridge/main.go -- go-redis
+		// v8 (this) predates the RESP3/HELLO and CLIENT SETINFO handshake
+		// behaviors that made v9 incompatible with twemproxy, so no
+		// equivalent option is needed here.
+		//
+		// twemproxy silently closes idle connections server-side, and
+		// without this the pool keeps handing out already-dead ones,
+		// surfacing as bare EOF.
+		IdleTimeout: 60 * time.Second,
+		// See the matching comment in cmd/streambridge/main.go -- matches
+		// vt-api-service's MaxRetries against the same twemproxy.
+		MaxRetries: 5,
 	})
 	defer rdb.Close()
 	reg := registry.New(rdb, cfg.Registry.KeyPrefix, cfg.Registry.SessionTTL)
