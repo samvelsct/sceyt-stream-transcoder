@@ -853,13 +853,28 @@ func (s *Server) servePlaylist(w http.ResponseWriter, r *http.Request, st *store
 	//currentPartIdx := st.GetCurrentPartIndex()
 	hasIt := st.HasPartOrSegment(targetMSN, targetPart)
 
-	// Per spec: if MSN is more than 2 ahead of current, return 400.
+	// A blocking-reload request within the spec's near-future window
+	// (targetMSN <= currentMSN+2) falls through to the WaitFor call below
+	// and never reaches here -- so every request that does land in this
+	// branch is, by construction, asking for something more than 2 MSNs
+	// away, which "wait a little longer" can never satisfy. In practice
+	// this isn't a malformed request: it's a player that was following
+	// this session before a StreamBridge instance failover rebuilt it
+	// (recoverStreamBridgeSession), which restarts MSN numbering at 0 on
+	// the new instance -- the player's cached high _HLS_msn from the old
+	// generation can now never be reached. Returning a hard 400 leaves
+	// the player to notice the error and fall back to a non-blocking
+	// reload on its own retry/backoff schedule, which is what was adding
+	// several extra seconds of frozen video after every recovery in
+	// practice. Serving the current playlist immediately instead lets any
+	// client that just parses whatever comes back resync in this single
+	// round trip.
 	if targetMSN > currentMSN+2 {
 		zlog.Warn().
 			Int("req_msn", targetMSN).
 			Int("store_current_msn", currentMSN).
-			Msg("playlist request: MSN too far in the future")
-		http.Error(w, "MSN too far in the future", http.StatusBadRequest)
+			Msg("playlist request: MSN too far in the future — serving current playlist so the client can resync")
+		generatePlaylist()
 		return
 	}
 
@@ -927,9 +942,26 @@ func (s *Server) servePart(w http.ResponseWriter, r *http.Request, st *store.Sto
 		return
 	}
 
-	//currentMSN := st.GetCurrentMSN()
-	//currentPartIdx := st.GetCurrentPartIndex()
+	currentMSN := st.GetCurrentMSN()
 	hasIt := st.HasPart(msn, partIdx)
+
+	// Mirrors servePlaylist's fast-reject: a part more than 2 MSNs ahead of
+	// current can't be a legitimate near-future request (those stay within
+	// the window and hit hasIt or the wait-below), and blindly blocking for
+	// up to 3xSegmentDuration (12s at the default 4s segment) on something
+	// that will never arrive -- e.g. a player still referencing a pre-
+	// failover MSN against a freshly rebuilt session that restarted
+	// numbering at 0 -- is exactly the multi-second stall recovery testing
+	// surfaced. Fail fast so the player's own error handling (typically
+	// much quicker than a 12s timeout) can kick in instead.
+	if !hasIt && msn > currentMSN+2 {
+		zlog.Warn().
+			Int("req_msn", msn).
+			Int("store_current_msn", currentMSN).
+			Msg("part request: MSN too far in the future — failing fast instead of blocking")
+		http.NotFound(w, r)
+		return
+	}
 
 	if !hasIt {
 		timeout := time.Duration(s.cfg.SegmentDuration*3) * time.Second
