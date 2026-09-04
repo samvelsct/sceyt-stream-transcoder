@@ -79,6 +79,18 @@ func generate(snap store.Snapshot, segmentDuration float64, partDuration float64
 		mediaSeq = snap.CurrentSegment.MSN
 	}
 	fmt.Fprintf(&b, "#EXT-X-MEDIA-SEQUENCE:%d\n", mediaSeq)
+
+	// Discontinuity sequence: same pre-skip-adjustment rule as
+	// EXT-X-MEDIA-SEQUENCE above — it reflects the discontinuity count as
+	// of the first segment in the full window.
+	discontinuitySeq := 0
+	if len(snap.Segments) > 0 {
+		discontinuitySeq = snap.Segments[0].DiscontinuitySeq
+	} else if snap.CurrentSegment != nil {
+		discontinuitySeq = snap.CurrentSegment.DiscontinuitySeq
+	}
+	fmt.Fprintf(&b, "#EXT-X-DISCONTINUITY-SEQUENCE:%d\n", discontinuitySeq)
+
 	b.WriteString("#EXT-X-MAP:URI=\"init.mp4\"\n")
 
 	if skippedCount > 0 {
@@ -93,6 +105,10 @@ func generate(snap store.Snapshot, segmentDuration float64, partDuration float64
 	for i, seg := range snap.Segments[segStart:] {
 		absIdx := segStart + i
 		isLast := absIdx == len(snap.Segments)-1
+
+		if seg.Discontinuity {
+			b.WriteString("#EXT-X-DISCONTINUITY\n")
+		}
 
 		if !programDateWritten {
 			fmt.Fprintf(&b, "#EXT-X-PROGRAM-DATE-TIME:%s\n", seg.StartTime.UTC().Format(time.RFC3339Nano))
@@ -117,6 +133,10 @@ func generate(snap store.Snapshot, segmentDuration float64, partDuration float64
 		b.WriteString("#EXT-X-ENDLIST\n")
 	} else if snap.CurrentSegment != nil {
 		cur := snap.CurrentSegment
+
+		if cur.Discontinuity {
+			b.WriteString("#EXT-X-DISCONTINUITY\n")
+		}
 
 		for _, part := range cur.Parts {
 			writePartTag(&b, part)

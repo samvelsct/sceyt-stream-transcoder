@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"path/filepath"
 	"sort"
@@ -495,6 +496,26 @@ func (s *Server) SetGeneration(sessionID string, generation int64) {
 	s.generations[sessionID] = generation
 }
 
+// MarkSessionDiscontinuity flags the given session's store so the next
+// segment it starts carries EXT-X-DISCONTINUITY in the playlist. Callers use
+// this when the Ownership Registry reports this session ID already had a
+// prior owner (generation > 1) — i.e. a StreamBridge instance failover moved
+// the session to a new pod. Each pod's store map is process-local in-memory
+// state, so this cross-pod case can't be detected by checking it directly;
+// the registry generation, backed by Redis, is the only signal that survives
+// across pods. Returns false if no store exists yet for this session ID
+// (e.g. called before RegisterSession, or after the session ended).
+func (s *Server) MarkSessionDiscontinuity(sessionID string) bool {
+	s.mu.RLock()
+	st, ok := s.stores[sessionID]
+	s.mu.RUnlock()
+	if !ok || st == nil {
+		return false
+	}
+	st.MarkDiscontinuity()
+	return true
+}
+
 type statusRecorder struct {
 	http.ResponseWriter
 	status int
@@ -530,6 +551,15 @@ func New(addr string, cfg *config.HLSConfig) *Server {
 	})
 	s.mux.HandleFunc("/metrics", s.metricsHandler)
 	s.mux.HandleFunc("/live/", s.indexHandler)
+
+	// Registered directly on this custom mux (not http.DefaultServeMux) so
+	// pprof only becomes reachable on this ClusterIP-only port — used for
+	// live heap-diff investigation, never exposed publicly.
+	s.mux.HandleFunc("/debug/pprof/", pprof.Index)
+	s.mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	s.mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	s.mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	s.mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 
 	s.httpSrv = &http.Server{
 		Addr:    addr,
