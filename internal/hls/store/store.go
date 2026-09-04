@@ -30,6 +30,9 @@ type Store struct {
 	PartHoldBack     float64
 	StreamStartTime  time.Time
 	ended            bool // set by Finalize; causes EXT-X-ENDLIST in playlist
+
+	pendingDiscontinuity bool // consumed by the next segment created
+	discontinuitySeq     int  // cumulative discontinuity count, see Segment.DiscontinuitySeq
 }
 
 // Snapshot is an immutable copy of store state for playlist generation.
@@ -71,6 +74,35 @@ func (s *Store) SetDiskWriter(dw *DiskWriter) {
 	s.diskWriter = dw
 }
 
+// MarkDiscontinuity flags that the next segment this store starts will carry
+// an EXT-X-DISCONTINUITY boundary. Callers use this when the underlying
+// source has reconnected in a way that breaks timestamp continuity with
+// segments already served (e.g. a StreamBridge instance failover), so
+// players reset their timestamp-continuity expectations instead of erroring
+// on the resulting jump.
+func (s *Store) MarkDiscontinuity() {
+	s.mu.Lock()
+	s.pendingDiscontinuity = true
+	s.mu.Unlock()
+}
+
+// newSegment allocates the next current segment, consuming any pending
+// discontinuity flag set via MarkDiscontinuity. Must be called with s.mu held.
+func (s *Store) newSegment() *Segment {
+	seg := &Segment{
+		MSN:       s.nextMSN,
+		StartTime: time.Now(),
+	}
+	s.nextMSN++
+	if s.pendingDiscontinuity {
+		seg.Discontinuity = true
+		s.discontinuitySeq++
+		s.pendingDiscontinuity = false
+	}
+	seg.DiscontinuitySeq = s.discontinuitySeq
+	return seg
+}
+
 // SetInit stores the ftyp+moov initialization segment.
 func (s *Store) SetInit(data []byte) {
 	s.mu.Lock()
@@ -101,11 +133,7 @@ func (s *Store) AddFragment(data []byte, durationSec float64, isKeyframe bool) {
 
 	// Lazy-initialize current segment and part.
 	if s.currentSeg == nil {
-		s.currentSeg = &Segment{
-			MSN:       s.nextMSN,
-			StartTime: time.Now(),
-		}
-		s.nextMSN++
+		s.currentSeg = s.newSegment()
 	}
 	if s.currentPart == nil {
 		s.currentPart = &partAccumulator{
@@ -211,18 +239,20 @@ func (s *Store) finalizeSegment() (broadcastMSN, broadcastPart int) {
 	completedSeg := s.currentSeg
 	s.segments = append(s.segments, s.currentSeg)
 
-	// Trim window.
+	// Trim window. Copy into a fresh backing array rather than re-slicing —
+	// s.segments[1:] only moves the slice header, so the dropped *Segment
+	// (and its Data/Parts byte buffers) would stay reachable through the
+	// old backing array for the life of the process instead of being
+	// garbage collected.
 	if len(s.segments) >= s.cfg.PlaylistWindow {
-		s.segments = s.segments[1:]
+		trimmed := make([]*Segment, len(s.segments)-1)
+		copy(trimmed, s.segments[1:])
+		s.segments = trimmed
 	}
 	//
 	completedMSN := s.currentSeg.MSN
 	// Start fresh segment.
-	s.currentSeg = &Segment{
-		MSN:       s.nextMSN,
-		StartTime: time.Now(),
-	}
-	s.nextMSN++
+	s.currentSeg = s.newSegment()
 
 	if s.diskWriter != nil {
 		s.diskWriter.WriteSegment(completedSeg)

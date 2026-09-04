@@ -30,6 +30,17 @@ type Segment struct {
 	Data      []byte    // full segment bytes (concatenation of all Part.Data)
 	StartTime time.Time // wall-clock time when this segment started (EXT-X-PROGRAM-DATE-TIME)
 	Completed bool      // false while still being assembled
+
+	// Discontinuity is true if this segment is the first one after a source
+	// discontinuity (e.g. a StreamBridge instance failover), meaning its
+	// audio/video timestamps are not continuous with the previous segment.
+	// The playlist generator emits EXT-X-DISCONTINUITY immediately before
+	// such a segment so players reset timestamp-continuity expectations
+	// instead of erroring on the jump.
+	Discontinuity bool
+	// DiscontinuitySeq is the cumulative count of discontinuities up to and
+	// including this segment, used to emit EXT-X-DISCONTINUITY-SEQUENCE.
+	DiscontinuitySeq int
 }
 
 func (s *Segment) FDuration() float64 {

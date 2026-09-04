@@ -251,6 +251,21 @@ func (s *Server) CreateSession(ctx context.Context, req *pb.CreateSessionRequest
 			s.generations[req.SessionId] = gen
 			if s.hlsSrv != nil {
 				s.hlsSrv.SetGeneration(req.SessionId, gen)
+				// generation > 1 means Redis's INCR found this session ID's
+				// counter key already present, i.e. some earlier pod (this
+				// one or, after a StreamBridge instance failover, a
+				// different one) already registered this session before.
+				// The registry is the only cross-pod signal available here:
+				// each pod's HLS store is process-local in-memory state, so
+				// a failover to a fresh pod can't be detected by looking at
+				// local store maps. Flag the new store's first segment so
+				// the playlist carries EXT-X-DISCONTINUITY, telling players
+				// to reset timestamp-continuity expectations instead of
+				// erroring on the resulting jump (e.g. ExoPlayer's
+				// AudioSink$UnexpectedDiscontinuityException).
+				if gen > 1 {
+					s.hlsSrv.MarkSessionDiscontinuity(req.SessionId)
+				}
 			}
 		}
 	}
