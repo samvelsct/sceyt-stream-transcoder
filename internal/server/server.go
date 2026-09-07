@@ -3,9 +3,11 @@ package server
 import (
 	"context"
 	"fmt"
+	"net"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"sync"
 	"time"
 	"vt-stream-transcoder/internal/webrtchls"
@@ -15,7 +17,9 @@ import (
 	"vt-stream-transcoder/internal/httpserver"
 
 	zlog "github.com/rs/zerolog/log"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 )
 
@@ -28,6 +32,77 @@ import (
 type SessionRegistry interface {
 	Register(ctx context.Context, sessionID, workerID, origin string) (generation int64, err error)
 	Finalize(ctx context.Context, sessionID string, generation int64) error
+	// GetOwner returns the workerID and HTTP origin address of whichever
+	// instance currently owns sessionID, used to forward a RemoveInput/
+	// DestroySession call that lands on a pod that no longer holds the
+	// session (e.g. the caller's own routing is stale after a failover).
+	GetOwner(ctx context.Context, sessionID string) (workerID, origin string, err error)
+}
+
+// forwardToOwner looks up sessionID's current owner via the Ownership
+// Registry and, if it's a different instance than this one, dials it and
+// invokes call against its gRPC service. This is the fix for a caller (e.g.
+// Fleet Controller) whose own routing is stale — after a StreamBridge
+// failover it can still send RemoveInput/DestroySession to the pod that
+// used to own the session instead of the one that now does, and those
+// calls were previously just dropped as NotFound. Returns ok=false whenever
+// forwarding isn't possible (registry disabled, lookup failed, this
+// instance is already the recorded owner, or the dial/call itself failed)
+// so the caller falls back to its own NotFound response — forwarding is a
+// best-effort improvement, never a requirement for correctness.
+func forwardToOwner[Resp any](ctx context.Context, s *Server, sessionID string, call func(pb.StreamBridgeClient) (Resp, error)) (resp Resp, ok bool) {
+	var zero Resp
+	if s.registry == nil {
+		return zero, false
+	}
+
+	lookupCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	ownerWorkerID, ownerOrigin, err := s.registry.GetOwner(lookupCtx, sessionID)
+	cancel()
+	if err != nil {
+		return zero, false
+	}
+	if ownerWorkerID == s.workerID {
+		// The registry says we already own it, but our local session map
+		// disagrees -- a real inconsistency, not a stale-routing problem.
+		// Forwarding to ourselves would just reproduce the NotFound.
+		return zero, false
+	}
+
+	grpcAddr, err := peerGRPCAddr(ownerOrigin, s.config.Server.Port)
+	if err != nil {
+		zlog.Warn().Err(err).Msgf("[%s] forwardToOwner: could not derive gRPC address from origin %q", sessionID, ownerOrigin)
+		return zero, false
+	}
+
+	conn, err := grpc.NewClient(grpcAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		zlog.Warn().Err(err).Msgf("[%s] forwardToOwner: dial %s failed", sessionID, grpcAddr)
+		return zero, false
+	}
+	defer conn.Close()
+
+	resp, err = call(pb.NewStreamBridgeClient(conn))
+	if err != nil {
+		zlog.Warn().Err(err).Msgf("[%s] forwardToOwner: call to owner %s (%s) failed", sessionID, ownerWorkerID, grpcAddr)
+		return zero, false
+	}
+
+	zlog.Info().Msgf("[%s] forwardToOwner: forwarded to owner %s (%s)", sessionID, ownerWorkerID, grpcAddr)
+	return resp, true
+}
+
+// peerGRPCAddr derives a peer's gRPC address from its published HTTP origin
+// address (host:httpPort) by pairing the same host with this instance's own
+// configured gRPC port -- every instance in the fleet runs the same
+// configuration, so the port is uniform even though the registry only
+// publishes the HTTP address (the one the Origin Router needs).
+func peerGRPCAddr(origin string, grpcPort int) (string, error) {
+	host, _, err := net.SplitHostPort(origin)
+	if err != nil {
+		return "", fmt.Errorf("split origin %q: %w", origin, err)
+	}
+	return net.JoinHostPort(host, strconv.Itoa(grpcPort)), nil
 }
 
 // Server implements the StreamBridge gRPC service
@@ -289,18 +364,25 @@ func (s *Server) DestroySession(ctx context.Context, req *pb.DestroySessionReque
 
 	zlog.Info().Msgf("[%s][MUTEX] DestroySession: write lock", req.SessionId)
 	s.mu.Lock()
-	defer func() {
-		s.mu.Unlock()
-		zlog.Info().Msgf("[%s][MUTEX] DestroySession: write unlocked", req.SessionId)
-	}()
-
 	session, exists := s.sessions[req.SessionId]
 	if !exists {
+		s.mu.Unlock()
+		zlog.Info().Msgf("[%s][MUTEX] DestroySession: write unlocked", req.SessionId)
+
+		if resp, ok := forwardToOwner(ctx, s, req.SessionId, func(client pb.StreamBridgeClient) (*pb.DestroySessionResponse, error) {
+			return client.DestroySession(ctx, req)
+		}); ok {
+			return resp, nil
+		}
 		return &pb.DestroySessionResponse{
 			Success: false,
 			Message: "session not found",
 		}, status.Error(codes.NotFound, "session not found")
 	}
+	defer func() {
+		s.mu.Unlock()
+		zlog.Info().Msgf("[%s][MUTEX] DestroySession: write unlocked", req.SessionId)
+	}()
 
 	zlog.Info().Msgf("[%s] DestroySession: session.Destroy", req.SessionId)
 	session.Destroy()
@@ -422,7 +504,7 @@ func (s *Server) AddInput(_ context.Context, req *pb.AddInputRequest) (*pb.AddIn
 }
 
 // RemoveInput removes a WebRTC input from a session
-func (s *Server) RemoveInput(_ context.Context, req *pb.RemoveInputRequest) (*pb.RemoveInputResponse, error) {
+func (s *Server) RemoveInput(ctx context.Context, req *pb.RemoveInputRequest) (*pb.RemoveInputResponse, error) {
 	zlog.Info().Msgf("[%s] RemoveInput: %v", req.SessionId, req)
 
 	zlog.Info().Msgf("[%s][MUTEX] RemoveInput: read lock", req.SessionId)
@@ -432,6 +514,11 @@ func (s *Server) RemoveInput(_ context.Context, req *pb.RemoveInputRequest) (*pb
 	zlog.Info().Msgf("[%s][MUTEX] RemoveInput: read unlocked", req.SessionId)
 
 	if !exists {
+		if resp, ok := forwardToOwner(ctx, s, req.SessionId, func(client pb.StreamBridgeClient) (*pb.RemoveInputResponse, error) {
+			return client.RemoveInput(ctx, req)
+		}); ok {
+			return resp, nil
+		}
 		return &pb.RemoveInputResponse{
 			Success: false,
 			Message: "session not found",
