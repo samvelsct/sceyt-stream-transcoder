@@ -265,6 +265,20 @@ func (r *Registry) Get(ctx context.Context, sessionID string) (*Record, error) {
 	return rec, err
 }
 
+// GetOwner returns the workerID and origin address of whichever instance
+// currently owns sessionID. It exists alongside Get so that callers needing
+// only ownership identity (e.g. internal/server's cross-pod RemoveInput/
+// DestroySession forwarding, when a call lands on a pod that no longer
+// holds the session locally) can depend on primitive types instead of
+// importing this package's Record type.
+func (r *Registry) GetOwner(ctx context.Context, sessionID string) (workerID, origin string, err error) {
+	rec, err := r.Get(ctx, sessionID)
+	if err != nil {
+		return "", "", err
+	}
+	return rec.WorkerID, rec.Origin, nil
+}
+
 func (r *Registry) getOnce(ctx context.Context, sessionID string) (*Record, error) {
 	gen, err := r.currentGeneration(ctx, sessionID)
 	if err != nil {
