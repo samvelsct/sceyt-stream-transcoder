@@ -24,6 +24,9 @@ service StreamBridge {
   // SetVideoOn sets the video on/off status for a participant
   rpc SetVideoOn(SetVideoOnRequest) returns (SetVideoOnResponse);
 
+  // SetHold sets the hold status for a participant
+  rpc SetHold(SetHoldRequest) returns (SetHoldResponse);
+
   // WriteID3Tag writes a custom ID3 tag to the HLS stream
   rpc WriteID3Tag(WriteID3TagRequest) returns (WriteID3TagResponse);
 
@@ -118,6 +121,19 @@ message SetVideoOnRequest {
 }
 
 message SetVideoOnResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// SetHoldRequest contains parameters for setting hold status
+message SetHoldRequest {
+  string session_id = 1;
+  string user_id = 2;
+  string client_id = 3;
+  bool hold = 4;
+}
+
+message SetHoldResponse {
   bool success = 1;
   string message = 2;
 }
