@@ -99,6 +99,19 @@ func New(resolver OwnershipResolver, liveness LivenessChecker, cacheTTL time.Dur
 		FlushInterval: -1, // stream immediately, no buffering
 		ErrorHandler: func(w http.ResponseWriter, req *http.Request, err error) {
 			sessionID := sessionIDFromPath(req.URL.Path)
+			// A canceled context means the VIEWER aborted the request (LL-HLS
+			// players, hls.js included, do this routinely and by design --
+			// e.g. dropping a PRELOAD-HINT fetch once a newer manifest
+			// supersedes it), not that the owning instance is unreachable.
+			// Treating it like a real backend failure was evicting the
+			// session's cached ownership resolution on every benign cancel,
+			// forcing the *next* request to pay for a fresh registry lookup
+			// it didn't need -- extra latency on exactly the players that
+			// cancel/retry most. The client is already gone, so there's also
+			// no one to receive the 502 written below.
+			if errors.Is(err, context.Canceled) {
+				return
+			}
 			zlog.Warn().Err(err).Msgf("[%s] origin router: proxy error", sessionID)
 			// Epic D3: a dead/unreachable owner means the session is
 			// unreachable, not a reason to guess at another worker. Evict

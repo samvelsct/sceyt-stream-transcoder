@@ -174,6 +174,39 @@ func TestServeHTTP_UnreachableOriginReturns502_EvictsCache(t *testing.T) {
 	}
 }
 
+func TestServeHTTP_ClientCanceledContext_DoesNotEvictCache(t *testing.T) {
+	origin := newOriginServer(t, func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	resolver := &fakeResolver{records: map[string]*registry.Record{
+		"sess-canceled": {SessionID: "sess-canceled", WorkerID: "pod-a", Origin: origin, Generation: 1, Status: registry.StatusActive},
+	}}
+	router := New(resolver, &fakeLiveness{}, time.Minute)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest("GET", pathPrefix+"sess-canceled/stream.m3u8", nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		cancel()
+	}()
+
+	router.ServeHTTP(rec, req)
+
+	router.mu.Lock()
+	_, cached := router.cache["sess-canceled"]
+	router.mu.Unlock()
+	if !cached {
+		t.Fatalf("expected the cache entry to survive a client-canceled request (viewer aborting a fetch is not a backend failure)")
+	}
+	if strings.Contains(rec.Body.String(), "origin unreachable") {
+		t.Fatalf("expected no 'origin unreachable' error body for a client-side cancel, got: %s", rec.Body.String())
+	}
+}
+
 func TestServeHTTP_UsesCacheWithinTTL(t *testing.T) {
 	origin := newOriginServer(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
 	resolver := &fakeResolver{records: map[string]*registry.Record{
